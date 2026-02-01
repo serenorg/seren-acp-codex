@@ -1,0 +1,42 @@
+[package]
+name = "seren-acp-codex"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["SerenAI <hello@serendb.com>"]
+description = "ACP agent bridging the Agent Client Protocol to OpenAI Codex CLI"
+license = "MIT"
+repository = "https://github.com/serenorg/seren-acp-codex"
+readme = "README.md"
+keywords = ["acp", "codex", "agent", "openai", "cli"]
+categories = ["development-tools", "api-bindings"]
+
+[lib]
+name = "seren_acp_codex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "seren-acp-codex"
+path = "src/main.rs"
+
+[dependencies]
+# ACP Protocol - official trait-based SDK
+agent-client-protocol = { version = "0.9", features = ["unstable"] }
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time", "process"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
