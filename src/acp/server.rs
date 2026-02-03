@@ -1,7 +1,7 @@
 // ABOUTME: ACP server implementation using official rust-sdk trait API
 // ABOUTME: Implements acp::Agent trait to bridge ACP to Codex app-server
 
-use crate::codex::{ApprovalPolicy, CodexClient, SandboxMode, ThreadStartParams, UserInput};
+use crate::codex::{ApprovalPolicy, CodexClient, McpServerConfig, SandboxMode, ThreadStartParams, UserInput};
 use agent_client_protocol::{self as acp, Client as _};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,6 +15,48 @@ enum AcpOutbound {
         request: acp::RequestPermissionRequest,
         response_tx: oneshot::Sender<Result<acp::RequestPermissionResponse, acp::Error>>,
     },
+}
+
+
+/// Convert ACP MCP server configurations to Codex config format
+fn convert_acp_mcp_to_codex(acp_servers: &[acp::McpServer]) -> Option<Vec<McpServerConfig>> {
+    if acp_servers.is_empty() {
+        return None;
+    }
+
+    let mut configs = Vec::new();
+    for server in acp_servers {
+        match server {
+            acp::McpServer::Stdio(stdio) => {
+                log::info!(
+                    "Converting MCP server '{}': command={:?}, args={:?}",
+                    stdio.name,
+                    stdio.command,
+                    stdio.args
+                );
+                let mut env = std::collections::HashMap::new();
+                for var in &stdio.env {
+                    env.insert(var.name.clone(), var.value.clone());
+                }
+                configs.push(McpServerConfig {
+                    name: stdio.name.clone(),
+                    command: stdio.command.to_string_lossy().to_string(),
+                    args: stdio.args.clone(),
+                    env,
+                });
+            }
+            // HTTP and SSE are not currently supported for codex
+            acp::McpServer::Http(_) | acp::McpServer::Sse(_) | _ => {
+                log::warn!("HTTP/SSE MCP servers not supported for Codex, skipping");
+            }
+        }
+    }
+
+    if configs.is_empty() {
+        None
+    } else {
+        Some(configs)
+    }
 }
 
 /// Session data mapping ACP session to Codex thread
@@ -51,7 +93,10 @@ impl CodexAgent {
     }
 
     /// Get or create Codex client
-    async fn get_codex(&self) -> Result<Arc<CodexClient>, acp::Error> {
+    async fn get_codex(
+        &self,
+        mcp_servers: Option<Vec<McpServerConfig>>,
+    ) -> Result<Arc<CodexClient>, acp::Error> {
         // Check if already connected
         {
             let guard = self.codex.read().await;
@@ -60,8 +105,8 @@ impl CodexAgent {
             }
         }
 
-        // Create new connection
-        let client = CodexClient::connect("stdio")
+        // Create new connection with MCP servers (only used on first connect)
+        let client = CodexClient::connect("stdio", mcp_servers)
             .await
             .map_err(|e| acp::Error::new(-32603, format!("Failed to connect to Codex: {}", e)))?;
         let client = Arc::new(client);
@@ -431,8 +476,15 @@ impl acp::Agent for CodexAgent {
         request: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
         log::info!("Received new session request for cwd: {:?}", request.cwd);
+        log::info!(
+            "MCP servers from client: {}",
+            request.mcp_servers.len()
+        );
 
-        let codex = self.get_codex().await?;
+        // Convert ACP MCP servers to Codex config format
+        let mcp_servers = convert_acp_mcp_to_codex(&request.mcp_servers);
+
+        let codex = self.get_codex(mcp_servers).await?;
 
         // Start a Codex thread
         let cwd = request.cwd.to_string_lossy().to_string();
@@ -496,7 +548,7 @@ impl acp::Agent for CodexAgent {
             request.session_id
         );
 
-        let codex = self.get_codex().await?;
+        let codex = self.get_codex(None).await?;
 
         // Get thread ID and session config for this session
         let (thread_id, approval_policy) = {
@@ -730,7 +782,7 @@ impl acp::Agent for CodexAgent {
             request.session_id
         );
 
-        let codex = self.get_codex().await?;
+        let codex = self.get_codex(None).await?;
 
         // Get thread ID and turn ID for this session
         let (thread_id, turn_id) = {

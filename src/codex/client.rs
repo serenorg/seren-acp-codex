@@ -38,11 +38,27 @@ pub struct CodexClient {
 
 impl CodexClient {
     /// Spawn and connect to Codex app-server
-    pub async fn connect(_url: &str) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `_url` - Unused URL parameter (kept for API compatibility)
+    /// * `mcp_servers` - Optional MCP server configurations to pass to codex
+    pub async fn connect(_url: &str, mcp_servers: Option<Vec<McpServerConfig>>) -> Result<Self> {
         info!("Spawning Codex app-server process");
 
-        let mut child = Command::new("codex")
-            .arg("app-server")
+        let mut cmd = Command::new("codex");
+        cmd.arg("app-server");
+
+        // Add MCP server configurations as -c arguments
+        if let Some(servers) = mcp_servers {
+            for server in servers {
+                info!("Adding MCP server '{}' to codex config", server.name);
+                for arg in server.to_config_args() {
+                    cmd.arg(arg);
+                }
+            }
+        }
+
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

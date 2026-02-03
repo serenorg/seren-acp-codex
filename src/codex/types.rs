@@ -159,3 +159,43 @@ pub struct ClientInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 }
+
+/// MCP server configuration for passing to Codex app-server
+#[derive(Debug, Clone)]
+pub struct McpServerConfig {
+    /// Server name (used as key in mcp_servers.<name>)
+    pub name: String,
+    /// Path to the executable
+    pub command: String,
+    /// Command arguments
+    pub args: Vec<String>,
+    /// Environment variables
+    pub env: HashMap<String, String>,
+}
+
+impl McpServerConfig {
+    /// Convert to -c arguments for codex app-server
+    pub fn to_config_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        let prefix = format!("mcp_servers.{}", self.name);
+
+        // Command
+        args.push("-c".to_string());
+        args.push(format!("{}.command=\"{}\"", prefix, self.command));
+
+        // Args (as TOML array)
+        if !self.args.is_empty() {
+            let args_toml: Vec<String> = self.args.iter().map(|a| format!("\"{}\"", a)).collect();
+            args.push("-c".to_string());
+            args.push(format!("{}.args=[{}]", prefix, args_toml.join(", ")));
+        }
+
+        // Environment variables
+        for (key, value) in &self.env {
+            args.push("-c".to_string());
+            args.push(format!("{}.env.{}=\"{}\"", prefix, key, value));
+        }
+
+        args
+    }
+}
