@@ -135,6 +135,7 @@ impl CodexClient {
                 let _ = pending_req
                     .tx
                     .send(JsonRpcMessage::Error(JsonRpcErrorResponse {
+                        jsonrpc: "2.0".to_string(),
                         id,
                         error: JsonRpcError {
                             code: -32000,
@@ -192,6 +193,7 @@ impl CodexClient {
                 debug!("Received server request: {}", request.method);
                 // Server requests (e.g., approval) are forwarded as notifications
                 let notif = JsonRpcNotification {
+                    jsonrpc: "2.0".to_string(),
                     method: format!("request:{}", request.method),
                     params: Some(serde_json::json!({
                         "id": request.id,
@@ -219,6 +221,7 @@ impl CodexClient {
     ) -> Result<serde_json::Value> {
         let id = self.next_id();
         let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
             id: id.clone(),
             method: method.to_string(),
             params,
@@ -269,6 +272,7 @@ impl CodexClient {
     /// Send a notification (no response expected)
     pub async fn notify(&self, method: &str, params: Option<serde_json::Value>) -> Result<()> {
         let notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
             method: method.to_string(),
             params,
         };
@@ -361,7 +365,7 @@ impl CodexClient {
 
     /// Respond to a server request (approval)
     pub async fn respond(&self, id: RequestId, result: serde_json::Value) -> Result<()> {
-        let response = JsonRpcResponse { id, result };
+        let response = JsonRpcResponse { jsonrpc: "2.0".to_string(), id, result };
         let json = serde_json::to_string(&response)?;
         self.tx
             .send(json)
@@ -378,6 +382,7 @@ impl CodexClient {
         data: Option<serde_json::Value>,
     ) -> Result<()> {
         let response = JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
             id,
             error: JsonRpcError {
                 code,

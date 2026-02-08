@@ -30,6 +30,7 @@ pub enum JsonRpcMessage {
 /// JSON-RPC request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
+    pub jsonrpc: String,
     pub id: RequestId,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,6 +40,7 @@ pub struct JsonRpcRequest {
 /// JSON-RPC successful response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
+    pub jsonrpc: String,
     pub id: RequestId,
     pub result: serde_json::Value,
 }
@@ -46,6 +48,7 @@ pub struct JsonRpcResponse {
 /// JSON-RPC error response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcErrorResponse {
+    pub jsonrpc: String,
     pub id: RequestId,
     pub error: JsonRpcError,
 }
@@ -62,6 +65,8 @@ pub struct JsonRpcError {
 /// JSON-RPC notification (no id, no response expected)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
+    #[serde(default)]
+    pub jsonrpc: String,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
