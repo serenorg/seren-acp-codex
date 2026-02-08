@@ -30,6 +30,7 @@ pub enum JsonRpcMessage {
 /// JSON-RPC request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
+    #[serde(default)]
     pub jsonrpc: String,
     pub id: RequestId,
     pub method: String,
@@ -40,6 +41,7 @@ pub struct JsonRpcRequest {
 /// JSON-RPC successful response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
+    #[serde(default)]
     pub jsonrpc: String,
     pub id: RequestId,
     pub result: serde_json::Value,
@@ -48,6 +50,7 @@ pub struct JsonRpcResponse {
 /// JSON-RPC error response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcErrorResponse {
+    #[serde(default)]
     pub jsonrpc: String,
     pub id: RequestId,
     pub error: JsonRpcError,
