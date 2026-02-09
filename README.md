@@ -9,6 +9,7 @@ ACP (Agent Client Protocol) for OpenAI Codex.
 - Translates ACP prompt turns to Codex app-server requests
 - Streams Codex events back to the client as ACP session updates
 - Bridges Codex approval prompts through ACP `session/request_permission`
+- Uses JSON-RPC 2.0 when talking to `codex app-server` (requests require `"jsonrpc":"2.0"`, and responses may omit it)
 
 ## Architecture
 

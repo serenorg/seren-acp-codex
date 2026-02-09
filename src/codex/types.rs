@@ -9,10 +9,15 @@ use std::path::PathBuf;
 // JSON-RPC Types
 // ============================================================================
 
-/// Request ID type (can be string or number)
+fn jsonrpc_v2() -> String {
+    "2.0".to_string()
+}
+
+/// Request ID type (can be string, number, or null)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {
+    Null,
     String(String),
     Number(i64),
 }
@@ -30,6 +35,8 @@ pub enum JsonRpcMessage {
 /// JSON-RPC request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
+    #[serde(default = "jsonrpc_v2")]
+    pub jsonrpc: String,
     pub id: RequestId,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,6 +46,8 @@ pub struct JsonRpcRequest {
 /// JSON-RPC successful response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
+    #[serde(default = "jsonrpc_v2")]
+    pub jsonrpc: String,
     pub id: RequestId,
     pub result: serde_json::Value,
 }
@@ -46,6 +55,8 @@ pub struct JsonRpcResponse {
 /// JSON-RPC error response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcErrorResponse {
+    #[serde(default = "jsonrpc_v2")]
+    pub jsonrpc: String,
     pub id: RequestId,
     pub error: JsonRpcError,
 }
@@ -62,6 +73,8 @@ pub struct JsonRpcError {
 /// JSON-RPC notification (no id, no response expected)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
+    #[serde(default = "jsonrpc_v2")]
+    pub jsonrpc: String,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,

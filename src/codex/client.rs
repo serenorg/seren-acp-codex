@@ -135,6 +135,7 @@ impl CodexClient {
                 let _ = pending_req
                     .tx
                     .send(JsonRpcMessage::Error(JsonRpcErrorResponse {
+                        jsonrpc: "2.0".to_string(),
                         id,
                         error: JsonRpcError {
                             code: -32000,
@@ -169,6 +170,13 @@ impl CodexClient {
         // Parse as JsonRpcMessage which handles all variants
         match serde_json::from_str::<JsonRpcMessage>(text) {
             Ok(JsonRpcMessage::Response(response)) => {
+                if matches!(response.id, RequestId::Null) {
+                    warn!(
+                        "Received JSON-RPC response with null id (dropping): {}",
+                        response.jsonrpc
+                    );
+                    return;
+                }
                 let mut guard = pending.write().await;
                 if let Some(req) = guard.remove(&response.id) {
                     let _ = req.tx.send(JsonRpcMessage::Response(response));
@@ -177,6 +185,23 @@ impl CodexClient {
                 }
             }
             Ok(JsonRpcMessage::Error(error)) => {
+                // JSON-RPC 2.0 allows `id: null` for errors where the request id is unknown.
+                // To avoid stranding callers until REQUEST_TIMEOUT, fail all in-flight requests.
+                if matches!(error.id, RequestId::Null) {
+                    warn!(
+                        "Received JSON-RPC error with null id; failing all pending requests: {} {}",
+                        error.error.code, error.error.message
+                    );
+                    let mut guard = pending.write().await;
+                    for (id, req) in guard.drain() {
+                        let _ = req.tx.send(JsonRpcMessage::Error(JsonRpcErrorResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id,
+                            error: error.error.clone(),
+                        }));
+                    }
+                    return;
+                }
                 let mut guard = pending.write().await;
                 if let Some(req) = guard.remove(&error.id) {
                     let _ = req.tx.send(JsonRpcMessage::Error(error));
@@ -192,6 +217,7 @@ impl CodexClient {
                 debug!("Received server request: {}", request.method);
                 // Server requests (e.g., approval) are forwarded as notifications
                 let notif = JsonRpcNotification {
+                    jsonrpc: "2.0".to_string(),
                     method: format!("request:{}", request.method),
                     params: Some(serde_json::json!({
                         "id": request.id,
@@ -201,8 +227,170 @@ impl CodexClient {
                 let _ = notif_tx.send(notif);
             }
             Err(e) => {
+                if Self::handle_message_fallback(text, pending, notif_tx).await {
+                    return;
+                }
                 warn!("Could not parse message: {} - {}", text, e);
             }
+        }
+    }
+
+    async fn handle_message_fallback(
+        text: &str,
+        pending: &Arc<RwLock<HashMap<RequestId, PendingRequest>>>,
+        notif_tx: &broadcast::Sender<JsonRpcNotification>,
+    ) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+            return false;
+        };
+        Self::handle_fallback_value(&value, pending, notif_tx).await
+    }
+
+    async fn handle_fallback_value(
+        value: &serde_json::Value,
+        pending: &Arc<RwLock<HashMap<RequestId, PendingRequest>>>,
+        notif_tx: &broadcast::Sender<JsonRpcNotification>,
+    ) -> bool {
+        match value {
+            serde_json::Value::Array(items) => {
+                // JSON-RPC batches are an array of messages. Best-effort process what we can.
+                let mut any_handled = false;
+                for item in items {
+                    any_handled |= Self::handle_fallback_value(item, pending, notif_tx).await;
+                }
+                return any_handled;
+            }
+            serde_json::Value::Object(obj) => {
+                // Classify as request/notification/response/error using standard JSON-RPC fields.
+                if let Some(method) = obj.get("method").and_then(|v| v.as_str()) {
+                    let params = obj.get("params").cloned();
+                    if let Some(id_value) = obj.get("id") {
+                        if let Some(id) = Self::parse_request_id(id_value) {
+                            // Server requests (e.g., approval) are forwarded as notifications.
+                            let notif = JsonRpcNotification {
+                                jsonrpc: "2.0".to_string(),
+                                method: format!("request:{method}"),
+                                params: Some(serde_json::json!({
+                                    "id": id,
+                                    "params": params
+                                })),
+                            };
+                            let _ = notif_tx.send(notif);
+                            return true;
+                        }
+                    }
+
+                    // Notification (no id / not parseable id)
+                    let notif = JsonRpcNotification {
+                        jsonrpc: "2.0".to_string(),
+                        method: method.to_string(),
+                        params,
+                    };
+                    let _ = notif_tx.send(notif);
+                    return true;
+                }
+
+                if obj.contains_key("result") && obj.contains_key("id") {
+                    let Some(id) = obj.get("id").and_then(Self::parse_request_id) else {
+                        return false;
+                    };
+                    if matches!(id, RequestId::Null) {
+                        warn!("Received JSON-RPC response with null id (dropping)");
+                        return true;
+                    }
+
+                    let response = JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: id.clone(),
+                        result: obj
+                            .get("result")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    };
+
+                    let mut guard = pending.write().await;
+                    if let Some(req) = guard.remove(&id) {
+                        let _ = req.tx.send(JsonRpcMessage::Response(response));
+                    } else {
+                        warn!("Received response for unknown request: {:?}", id);
+                    }
+                    return true;
+                }
+
+                if obj.contains_key("error") && obj.contains_key("id") {
+                    let Some(id) = obj.get("id").and_then(Self::parse_request_id) else {
+                        return false;
+                    };
+
+                    let error_obj = obj.get("error").unwrap_or(&serde_json::Value::Null);
+                    let error = JsonRpcErrorResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: id.clone(),
+                        error: Self::parse_error(error_obj),
+                    };
+
+                    // Mirror the strict-path behavior for `id: null`.
+                    if matches!(id, RequestId::Null) {
+                        warn!(
+                            "Received JSON-RPC error with null id; failing all pending requests: {} {}",
+                            error.error.code, error.error.message
+                        );
+                        let mut guard = pending.write().await;
+                        for (pending_id, req) in guard.drain() {
+                            let _ = req.tx.send(JsonRpcMessage::Error(JsonRpcErrorResponse {
+                                jsonrpc: "2.0".to_string(),
+                                id: pending_id,
+                                error: error.error.clone(),
+                            }));
+                        }
+                        return true;
+                    }
+
+                    let mut guard = pending.write().await;
+                    if let Some(req) = guard.remove(&id) {
+                        let _ = req.tx.send(JsonRpcMessage::Error(error));
+                    } else {
+                        warn!("Received error for unknown request: {:?}", id);
+                    }
+                    return true;
+                }
+
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn parse_request_id(v: &serde_json::Value) -> Option<RequestId> {
+        match v {
+            serde_json::Value::Null => Some(RequestId::Null),
+            serde_json::Value::String(s) => Some(RequestId::String(s.clone())),
+            serde_json::Value::Number(n) => n.as_i64().map(RequestId::Number),
+            _ => None,
+        }
+    }
+
+    fn parse_error(v: &serde_json::Value) -> JsonRpcError {
+        let serde_json::Value::Object(obj) = v else {
+            return JsonRpcError {
+                code: -32603,
+                message: v.to_string(),
+                data: None,
+            };
+        };
+
+        let code = obj.get("code").and_then(|v| v.as_i64()).unwrap_or(-32603);
+        let message = obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown error")
+            .to_string();
+        let data = obj.get("data").cloned();
+
+        JsonRpcError {
+            code,
+            message,
+            data,
         }
     }
 
@@ -219,6 +407,7 @@ impl CodexClient {
     ) -> Result<serde_json::Value> {
         let id = self.next_id();
         let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
             id: id.clone(),
             method: method.to_string(),
             params,
@@ -269,6 +458,7 @@ impl CodexClient {
     /// Send a notification (no response expected)
     pub async fn notify(&self, method: &str, params: Option<serde_json::Value>) -> Result<()> {
         let notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
             method: method.to_string(),
             params,
         };
@@ -361,7 +551,11 @@ impl CodexClient {
 
     /// Respond to a server request (approval)
     pub async fn respond(&self, id: RequestId, result: serde_json::Value) -> Result<()> {
-        let response = JsonRpcResponse { id, result };
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result,
+        };
         let json = serde_json::to_string(&response)?;
         self.tx
             .send(json)
@@ -378,6 +572,7 @@ impl CodexClient {
         data: Option<serde_json::Value>,
     ) -> Result<()> {
         let response = JsonRpcErrorResponse {
+            jsonrpc: "2.0".to_string(),
             id,
             error: JsonRpcError {
                 code,
