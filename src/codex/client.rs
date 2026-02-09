@@ -251,114 +251,124 @@ impl CodexClient {
         pending: &Arc<RwLock<HashMap<RequestId, PendingRequest>>>,
         notif_tx: &broadcast::Sender<JsonRpcNotification>,
     ) -> bool {
-        match value {
-            serde_json::Value::Array(items) => {
-                // JSON-RPC batches are an array of messages. Best-effort process what we can.
-                let mut any_handled = false;
-                for item in items {
-                    any_handled |= Self::handle_fallback_value(item, pending, notif_tx).await;
+        // Avoid recursion in async fn by using an explicit stack.
+        let mut stack = vec![value];
+        let mut any_handled = false;
+
+        while let Some(value) = stack.pop() {
+            match value {
+                serde_json::Value::Array(items) => {
+                    // Preserve original order by pushing in reverse (stack is LIFO).
+                    for item in items.iter().rev() {
+                        stack.push(item);
+                    }
                 }
-                return any_handled;
-            }
-            serde_json::Value::Object(obj) => {
-                // Classify as request/notification/response/error using standard JSON-RPC fields.
-                if let Some(method) = obj.get("method").and_then(|v| v.as_str()) {
-                    let params = obj.get("params").cloned();
-                    if let Some(id_value) = obj.get("id") {
-                        if let Some(id) = Self::parse_request_id(id_value) {
-                            // Server requests (e.g., approval) are forwarded as notifications.
-                            let notif = JsonRpcNotification {
-                                jsonrpc: "2.0".to_string(),
-                                method: format!("request:{method}"),
-                                params: Some(serde_json::json!({
-                                    "id": id,
-                                    "params": params
-                                })),
-                            };
-                            let _ = notif_tx.send(notif);
-                            return true;
+                serde_json::Value::Object(obj) => {
+                    // Classify as request/notification/response/error using standard JSON-RPC fields.
+                    if let Some(method) = obj.get("method").and_then(|v| v.as_str()) {
+                        let params = obj.get("params").cloned();
+                        if let Some(id_value) = obj.get("id") {
+                            if let Some(id) = Self::parse_request_id(id_value) {
+                                // Server requests (e.g., approval) are forwarded as notifications.
+                                let notif = JsonRpcNotification {
+                                    jsonrpc: "2.0".to_string(),
+                                    method: format!("request:{method}"),
+                                    params: Some(serde_json::json!({
+                                        "id": id,
+                                        "params": params
+                                    })),
+                                };
+                                let _ = notif_tx.send(notif);
+                                any_handled = true;
+                                continue;
+                            }
                         }
+
+                        // Notification (no id / not parseable id)
+                        let notif = JsonRpcNotification {
+                            jsonrpc: "2.0".to_string(),
+                            method: method.to_string(),
+                            params,
+                        };
+                        let _ = notif_tx.send(notif);
+                        any_handled = true;
+                        continue;
                     }
 
-                    // Notification (no id / not parseable id)
-                    let notif = JsonRpcNotification {
-                        jsonrpc: "2.0".to_string(),
-                        method: method.to_string(),
-                        params,
-                    };
-                    let _ = notif_tx.send(notif);
-                    return true;
-                }
+                    if obj.contains_key("result") && obj.contains_key("id") {
+                        let Some(id) = obj.get("id").and_then(Self::parse_request_id) else {
+                            continue;
+                        };
+                        if matches!(id, RequestId::Null) {
+                            warn!("Received JSON-RPC response with null id (dropping)");
+                            any_handled = true;
+                            continue;
+                        }
 
-                if obj.contains_key("result") && obj.contains_key("id") {
-                    let Some(id) = obj.get("id").and_then(Self::parse_request_id) else {
-                        return false;
-                    };
-                    if matches!(id, RequestId::Null) {
-                        warn!("Received JSON-RPC response with null id (dropping)");
-                        return true;
-                    }
+                        let response = JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: id.clone(),
+                            result: obj
+                                .get("result")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        };
 
-                    let response = JsonRpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: id.clone(),
-                        result: obj
-                            .get("result")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                    };
-
-                    let mut guard = pending.write().await;
-                    if let Some(req) = guard.remove(&id) {
-                        let _ = req.tx.send(JsonRpcMessage::Response(response));
-                    } else {
-                        warn!("Received response for unknown request: {:?}", id);
-                    }
-                    return true;
-                }
-
-                if obj.contains_key("error") && obj.contains_key("id") {
-                    let Some(id) = obj.get("id").and_then(Self::parse_request_id) else {
-                        return false;
-                    };
-
-                    let error_obj = obj.get("error").unwrap_or(&serde_json::Value::Null);
-                    let error = JsonRpcErrorResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: id.clone(),
-                        error: Self::parse_error(error_obj),
-                    };
-
-                    // Mirror the strict-path behavior for `id: null`.
-                    if matches!(id, RequestId::Null) {
-                        warn!(
-                            "Received JSON-RPC error with null id; failing all pending requests: {} {}",
-                            error.error.code, error.error.message
-                        );
                         let mut guard = pending.write().await;
-                        for (pending_id, req) in guard.drain() {
-                            let _ = req.tx.send(JsonRpcMessage::Error(JsonRpcErrorResponse {
-                                jsonrpc: "2.0".to_string(),
-                                id: pending_id,
-                                error: error.error.clone(),
-                            }));
+                        if let Some(req) = guard.remove(&id) {
+                            let _ = req.tx.send(JsonRpcMessage::Response(response));
+                        } else {
+                            warn!("Received response for unknown request: {:?}", id);
                         }
-                        return true;
+                        any_handled = true;
+                        continue;
                     }
 
-                    let mut guard = pending.write().await;
-                    if let Some(req) = guard.remove(&id) {
-                        let _ = req.tx.send(JsonRpcMessage::Error(error));
-                    } else {
-                        warn!("Received error for unknown request: {:?}", id);
+                    if obj.contains_key("error") && obj.contains_key("id") {
+                        let Some(id) = obj.get("id").and_then(Self::parse_request_id) else {
+                            continue;
+                        };
+
+                        let error_obj = obj.get("error").unwrap_or(&serde_json::Value::Null);
+                        let error = JsonRpcErrorResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: id.clone(),
+                            error: Self::parse_error(error_obj),
+                        };
+
+                        // Mirror the strict-path behavior for `id: null`.
+                        if matches!(id, RequestId::Null) {
+                            warn!(
+                                "Received JSON-RPC error with null id; failing all pending requests: {} {}",
+                                error.error.code, error.error.message
+                            );
+                            let mut guard = pending.write().await;
+                            for (pending_id, req) in guard.drain() {
+                                let _ = req.tx.send(JsonRpcMessage::Error(JsonRpcErrorResponse {
+                                    jsonrpc: "2.0".to_string(),
+                                    id: pending_id,
+                                    error: error.error.clone(),
+                                }));
+                            }
+                            any_handled = true;
+                            continue;
+                        }
+
+                        let mut guard = pending.write().await;
+                        if let Some(req) = guard.remove(&id) {
+                            let _ = req.tx.send(JsonRpcMessage::Error(error));
+                        } else {
+                            warn!("Received error for unknown request: {:?}", id);
+                        }
+                        any_handled = true;
+                        continue;
                     }
-                    return true;
                 }
-
-                false
+                _ => {}
             }
-            _ => false,
         }
+
+        any_handled
     }
 
     fn parse_request_id(v: &serde_json::Value) -> Option<RequestId> {
@@ -498,15 +508,84 @@ impl CodexClient {
 
     /// Start a new thread
     pub async fn thread_start(&self, params: ThreadStartParams) -> Result<String> {
-        let result = self
-            .request("thread/start", Some(serde_json::to_value(&params)?))
-            .await?;
+        let result = self.thread_start_full(params).await?;
         let thread_id = result
             .get("thread")
             .and_then(|t| t.get("id"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::CodexConnection("No thread.id in response".to_string()))?;
         Ok(thread_id.to_string())
+    }
+
+    pub async fn thread_start_full(&self, params: ThreadStartParams) -> Result<serde_json::Value> {
+        self.request("thread/start", Some(serde_json::to_value(&params)?))
+            .await
+    }
+
+    pub async fn thread_resume(&self, params: ThreadResumeParams) -> Result<serde_json::Value> {
+        self.request("thread/resume", Some(serde_json::to_value(&params)?))
+            .await
+    }
+
+    pub async fn thread_read(
+        &self,
+        thread_id: &str,
+        include_turns: bool,
+    ) -> Result<serde_json::Value> {
+        let params = ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns,
+        };
+        self.request("thread/read", Some(serde_json::to_value(&params)?))
+            .await
+    }
+
+    pub async fn thread_list(
+        &self,
+        cursor: Option<String>,
+        limit: Option<u32>,
+        sort_key: Option<String>,
+    ) -> Result<serde_json::Value> {
+        let params = ThreadListParams {
+            cursor,
+            limit,
+            sort_key,
+            archived: Some(false),
+        };
+        self.request("thread/list", Some(serde_json::to_value(&params)?))
+            .await
+    }
+
+    pub async fn model_list(
+        &self,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<serde_json::Value> {
+        let params = ModelListParams { cursor, limit };
+        self.request("model/list", Some(serde_json::to_value(&params)?))
+            .await
+    }
+
+    pub async fn account_read(&self, refresh_token: bool) -> Result<serde_json::Value> {
+        let params = GetAccountParams { refresh_token };
+        self.request("account/read", Some(serde_json::to_value(&params)?))
+            .await
+    }
+
+    pub async fn account_login_start(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.request("account/login/start", Some(params)).await
+    }
+
+    pub async fn account_login_cancel(&self, login_id: &str) -> Result<()> {
+        self.request(
+            "account/login/cancel",
+            Some(serde_json::json!({ "loginId": login_id })),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Start a turn - send user input and begin agent processing
@@ -520,12 +599,27 @@ impl CodexClient {
         input: Vec<UserInput>,
         approval_policy: Option<ApprovalPolicy>,
     ) -> Result<String> {
+        self.turn_start_with_overrides(thread_id, input, approval_policy, None, None, None)
+            .await
+    }
+
+    pub async fn turn_start_with_overrides(
+        &self,
+        thread_id: &str,
+        input: Vec<UserInput>,
+        approval_policy: Option<ApprovalPolicy>,
+        model: Option<String>,
+        effort: Option<String>,
+        summary: Option<String>,
+    ) -> Result<String> {
         let params = TurnStartParams {
             thread_id: thread_id.to_string(),
             input,
             cwd: None,
             approval_policy,
-            model: None,
+            effort,
+            summary,
+            model,
         };
         let result = self
             .request("turn/start", Some(serde_json::to_value(&params)?))

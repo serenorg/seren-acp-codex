@@ -1,9 +1,13 @@
 // ABOUTME: ACP server implementation using official rust-sdk trait API
 // ABOUTME: Implements acp::Agent trait to bridge ACP to Codex app-server
 
-use crate::codex::{ApprovalPolicy, CodexClient, McpServerConfig, SandboxMode, ThreadStartParams, UserInput};
+use crate::codex::{
+    ApprovalPolicy, CodexClient, McpServerConfig, SandboxMode, ThreadStartParams, UserInput,
+};
 use agent_client_protocol::{self as acp, Client as _};
+use base64::Engine as _;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -16,7 +20,6 @@ enum AcpOutbound {
         response_tx: oneshot::Sender<Result<acp::RequestPermissionResponse, acp::Error>>,
     },
 }
-
 
 /// Convert ACP MCP server configurations to Codex config format
 fn convert_acp_mcp_to_codex(acp_servers: &[acp::McpServer]) -> Option<Vec<McpServerConfig>> {
@@ -66,6 +69,9 @@ struct SessionData {
     #[allow(dead_code)]
     cwd: String,
     approval_policy: ApprovalPolicy,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    last_turn_diff: Option<String>,
     known_tool_calls: HashSet<String>,
 }
 
@@ -77,8 +83,6 @@ pub struct CodexAgent {
     codex: RwLock<Option<Arc<CodexClient>>>,
     /// Session mappings: session_id -> SessionData
     sessions: RwLock<HashMap<String, SessionData>>,
-    /// Next session ID counter
-    next_session_id: RwLock<u64>,
 }
 
 impl CodexAgent {
@@ -88,7 +92,6 @@ impl CodexAgent {
             acp_tx,
             codex: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
-            next_session_id: RwLock::new(0),
         }
     }
 
@@ -117,6 +120,148 @@ impl CodexAgent {
         Ok(client)
     }
 
+    fn temp_dir_for_session(session_id: &acp::SessionId) -> PathBuf {
+        // Keep it simple and avoid trusting session_id for path components.
+        let mut dir = std::env::temp_dir();
+        dir.push("seren-acp-codex");
+        dir.push("sessions");
+        dir.push(uuid::Uuid::new_v4().to_string());
+        // Include the session id as a filename prefix in generated files only (not a directory).
+        let _ = session_id;
+        dir
+    }
+
+    fn image_extension_for_mime(mime_type: &str) -> &'static str {
+        match mime_type {
+            "image/png" => "png",
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            _ => "bin",
+        }
+    }
+
+    async fn write_temp_image(
+        &self,
+        session_id: &acp::SessionId,
+        mime_type: &str,
+        data: &str,
+    ) -> Result<PathBuf, acp::Error> {
+        // ACP ImageContent.data is base64-encoded image bytes.
+        let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(cleaned)
+            .map_err(|e| {
+                acp::Error::invalid_params().data(serde_json::Value::String(format!(
+                    "Invalid base64 image data: {e}"
+                )))
+            })?;
+
+        let mut dir = Self::temp_dir_for_session(session_id);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| acp::Error::into_internal_error(e))?;
+
+        let ext = Self::image_extension_for_mime(mime_type);
+        let filename = format!("image-{}.{}", uuid::Uuid::new_v4(), ext);
+        dir.push(filename);
+
+        tokio::fs::write(&dir, bytes)
+            .await
+            .map_err(|e| acp::Error::into_internal_error(e))?;
+
+        Ok(dir)
+    }
+
+    fn format_resource_link(link: &acp::ResourceLink) -> String {
+        let mut out = String::new();
+        out.push_str("[ResourceLink]\n");
+        out.push_str(&format!("name: {}\n", link.name));
+        out.push_str(&format!("uri: {}\n", link.uri));
+        if let Some(title) = &link.title {
+            out.push_str(&format!("title: {title}\n"));
+        }
+        if let Some(description) = &link.description {
+            out.push_str(&format!("description: {description}\n"));
+        }
+        if let Some(mime_type) = &link.mime_type {
+            out.push_str(&format!("mime: {mime_type}\n"));
+        }
+        if let Some(size) = link.size {
+            out.push_str(&format!("size: {size}\n"));
+        }
+        out
+    }
+
+    fn format_embedded_resource(resource: &acp::EmbeddedResource) -> String {
+        match &resource.resource {
+            acp::EmbeddedResourceResource::TextResourceContents(text) => {
+                let mime = text.mime_type.as_deref().unwrap_or("text/plain");
+                format!(
+                    "[Resource]\nuri: {}\nmime: {}\n\n{}\n",
+                    text.uri, mime, text.text
+                )
+            }
+            acp::EmbeddedResourceResource::BlobResourceContents(blob) => {
+                let mime = blob
+                    .mime_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream");
+                format!(
+                    "[Resource]\nuri: {}\nmime: {}\n\n(binary content: {} base64 chars)\n",
+                    blob.uri,
+                    mime,
+                    blob.blob.len()
+                )
+            }
+            _ => "[Resource]\n(unrecognized embedded resource)\n".to_string(),
+        }
+    }
+
+    async fn content_blocks_to_user_input(
+        &self,
+        session_id: &acp::SessionId,
+        blocks: &[acp::ContentBlock],
+    ) -> Result<Vec<UserInput>, acp::Error> {
+        let mut out = Vec::new();
+
+        for block in blocks {
+            match block {
+                acp::ContentBlock::Text(text) => out.push(UserInput::Text {
+                    text: text.text.clone(),
+                }),
+                acp::ContentBlock::ResourceLink(link) => out.push(UserInput::Text {
+                    text: Self::format_resource_link(link),
+                }),
+                acp::ContentBlock::Resource(resource) => out.push(UserInput::Text {
+                    text: Self::format_embedded_resource(resource),
+                }),
+                acp::ContentBlock::Image(image) => {
+                    let path = self
+                        .write_temp_image(session_id, &image.mime_type, &image.data)
+                        .await?;
+                    out.push(UserInput::LocalImage { path });
+                }
+                acp::ContentBlock::Audio(_) => {
+                    return Err(acp::Error::invalid_params().data(serde_json::Value::String(
+                        "Audio content blocks are not supported".to_string(),
+                    )));
+                }
+                _ => {
+                    // Ignore unknown / future content blocks.
+                }
+            }
+        }
+
+        if out.is_empty() {
+            return Err(acp::Error::invalid_params().data(serde_json::Value::String(
+                "Prompt contained no supported content blocks".to_string(),
+            )));
+        }
+
+        Ok(out)
+    }
+
     fn approval_policy_for_mode(mode_id: &str) -> ApprovalPolicy {
         match mode_id {
             // "Ask before running tools"
@@ -134,6 +279,580 @@ impl CodexAgent {
             .description("Auto-approve safe operations".to_string());
 
         acp::SessionModeState::new("ask", vec![ask_mode, auto_mode])
+    }
+
+    fn parse_approval_policy(value: &str) -> Option<ApprovalPolicy> {
+        match value {
+            "untrusted" => Some(ApprovalPolicy::UnlessTrusted),
+            "on-failure" => Some(ApprovalPolicy::OnFailure),
+            "on-request" => Some(ApprovalPolicy::OnRequest),
+            "never" => Some(ApprovalPolicy::Never),
+            _ => None,
+        }
+    }
+
+    async fn ensure_authenticated(&self, codex: &CodexClient) -> Result<(), acp::Error> {
+        let account = codex
+            .account_read(false)
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to read account: {e}")))?;
+        let requires_auth = account
+            .get("requiresOpenaiAuth")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let has_account = account
+            .get("account")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        if requires_auth && !has_account {
+            return Err(acp::Error::auth_required());
+        }
+        Ok(())
+    }
+
+    async fn build_model_state(
+        &self,
+        codex: &CodexClient,
+        preferred_model: Option<&str>,
+    ) -> Result<acp::SessionModelState, acp::Error> {
+        let raw = codex
+            .model_list(None, Some(200))
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to list models: {e}")))?;
+
+        let items = raw
+            .get("data")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| acp::Error::new(-32603, "Codex model/list response missing data"))?;
+
+        let mut available = Vec::new();
+        let mut default_model_id: Option<String> = None;
+
+        for m in items {
+            let Some(id) = m.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let name = m
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id)
+                .to_string();
+            let description = m
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if m.get("isDefault")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                default_model_id = Some(id.to_string());
+            }
+
+            let mut info = acp::ModelInfo::new(acp::ModelId::new(id.to_string()), name);
+            if let Some(desc) = description {
+                info = info.description(desc);
+            }
+            available.push(info);
+        }
+
+        let current = preferred_model
+            .map(|s| s.to_string())
+            .filter(|id| available.iter().any(|m| m.model_id.0.as_ref() == id))
+            .or(default_model_id)
+            .or_else(|| available.first().map(|m| m.model_id.0.as_ref().to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Ok(acp::SessionModelState::new(
+            acp::ModelId::new(current),
+            available,
+        ))
+    }
+
+    async fn build_config_options(
+        &self,
+        codex: &CodexClient,
+        current_model: Option<&str>,
+        current_effort: Option<&str>,
+    ) -> Result<Vec<acp::SessionConfigOption>, acp::Error> {
+        let raw = codex
+            .model_list(None, Some(200))
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to list models: {e}")))?;
+        let items = raw.get("data").and_then(|v| v.as_array());
+
+        let mut supported_efforts: Vec<acp::SessionConfigSelectOption> = Vec::new();
+        let mut default_effort: Option<String> = None;
+
+        let mut model_match = None;
+        if let Some(items) = items {
+            for m in items {
+                let Some(id) = m.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if Some(id) == current_model {
+                    model_match = Some(m);
+                    break;
+                }
+                if model_match.is_none()
+                    && m.get("isDefault")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                {
+                    model_match = Some(m);
+                }
+            }
+        }
+
+        if let Some(m) = model_match {
+            default_effort = m
+                .get("defaultReasoningEffort")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if let Some(opts) = m
+                .get("supportedReasoningEfforts")
+                .and_then(|v| v.as_array())
+            {
+                for opt in opts {
+                    let Some(effort) = opt.get("reasoningEffort").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let desc = opt
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let name = effort.to_string();
+                    let mut entry = acp::SessionConfigSelectOption::new(effort.to_string(), name);
+                    if let Some(d) = desc {
+                        entry = entry.description(d);
+                    }
+                    supported_efforts.push(entry);
+                }
+            }
+        }
+
+        if supported_efforts.is_empty() {
+            for effort in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+                supported_efforts.push(acp::SessionConfigSelectOption::new(
+                    effort,
+                    effort.to_string(),
+                ));
+            }
+        }
+
+        let chosen_effort = current_effort
+            .map(|s| s.to_string())
+            .or(default_effort)
+            .unwrap_or_else(|| "medium".to_string());
+
+        let reasoning = acp::SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning effort",
+            chosen_effort,
+            supported_efforts,
+        )
+        .category(acp::SessionConfigOptionCategory::ThoughtLevel)
+        .description("Codex reasoning effort override for this session.");
+
+        Ok(vec![reasoning])
+    }
+
+    async fn replay_thread_items(
+        &self,
+        session_id: &acp::SessionId,
+        thread: &serde_json::Value,
+    ) -> Result<(), acp::Error> {
+        if let Some(turns) = thread.get("turns").and_then(|v| v.as_array()) {
+            for turn in turns {
+                if let Some(items) = turn.get("items").and_then(|v| v.as_array()) {
+                    for item in items {
+                        self.replay_item(session_id, item).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn replay_item(
+        &self,
+        session_id: &acp::SessionId,
+        item: &serde_json::Value,
+    ) -> Result<(), acp::Error> {
+        let Some(item_type) = item.get("type").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+
+        match item_type {
+            "userMessage" => {
+                if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+                    for block in content {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                            let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            self.emit_session_update(
+                                session_id.clone(),
+                                acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                                    acp::ContentBlock::Text(acp::TextContent::new(
+                                        text.to_string(),
+                                    )),
+                                )),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            "agentMessage" => {
+                let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                self.emit_session_update(
+                    session_id.clone(),
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                        acp::ContentBlock::Text(acp::TextContent::new(text.to_string())),
+                    )),
+                )
+                .await?;
+            }
+            "reasoning" => {
+                let parts = item
+                    .get("content")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let text = parts
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.is_empty() {
+                    self.emit_session_update(
+                        session_id.clone(),
+                        acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                            acp::ContentBlock::Text(acp::TextContent::new(text)),
+                        )),
+                    )
+                    .await?;
+                }
+            }
+            // Tool calls: best-effort replay for rich UI.
+            "commandExecution"
+            | "fileChange"
+            | "mcpToolCall"
+            | "webSearch"
+            | "imageView"
+            | "enteredReviewMode"
+            | "exitedReviewMode"
+            | "contextCompaction"
+            | "collabAgentToolCall" => {
+                self.replay_tool_item(session_id, item).await?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    async fn replay_tool_item(
+        &self,
+        session_id: &acp::SessionId,
+        item: &serde_json::Value,
+    ) -> Result<(), acp::Error> {
+        let Some(item_id) = item.get("id").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+        let Some(item_type) = item.get("type").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+
+        let (kind, title, status) = Self::tool_call_fields_for_item(item_type, item);
+        let tool_call_id_str = Self::tool_call_id_string_for_codex_item(item_id);
+        let tool_call_id = acp::ToolCallId::new(tool_call_id_str.clone());
+
+        // Avoid duplicating tool calls if we already emitted them.
+        let first_seen = {
+            let mut sessions = self.sessions.write().await;
+            let session_id_str: &str = &session_id.0;
+            sessions
+                .get_mut(session_id_str)
+                .map(|s| s.known_tool_calls.insert(tool_call_id_str.clone()))
+                .unwrap_or(true)
+        };
+
+        if first_seen {
+            self.emit_session_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(tool_call_id.clone(), title.clone())
+                        .kind(kind)
+                        .status(status)
+                        .raw_input(item.clone()),
+                ),
+            )
+            .await?;
+        }
+
+        let mut fields = acp::ToolCallUpdateFields::new()
+            .kind(kind)
+            .status(status)
+            .raw_output(item.clone());
+
+        if item_type == "fileChange" {
+            if let Some(content) = self
+                .diff_content_from_file_change_item(session_id, item)
+                .await
+            {
+                fields = fields.content(content);
+            }
+        }
+
+        self.emit_session_update(
+            session_id.clone(),
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(tool_call_id, fields)),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    fn tool_call_fields_for_item(
+        item_type: &str,
+        item: &serde_json::Value,
+    ) -> (acp::ToolKind, String, acp::ToolCallStatus) {
+        match item_type {
+            "commandExecution" => {
+                let command = item
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        item.get("command").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                    })
+                    .unwrap_or_default();
+                let title = if command.is_empty() {
+                    "Run command".to_string()
+                } else {
+                    format!("Run command: {command}")
+                };
+                let status = item.get("status").and_then(|v| v.as_str());
+                let status = match status {
+                    Some("failed") | Some("declined") => acp::ToolCallStatus::Failed,
+                    Some("completed") => acp::ToolCallStatus::Completed,
+                    _ => acp::ToolCallStatus::InProgress,
+                };
+                (acp::ToolKind::Execute, title, status)
+            }
+            "fileChange" => {
+                let title = "Apply file changes".to_string();
+                let status = item.get("status").and_then(|v| v.as_str());
+                let status = match status {
+                    Some("failed") | Some("declined") => acp::ToolCallStatus::Failed,
+                    Some("completed") => acp::ToolCallStatus::Completed,
+                    _ => acp::ToolCallStatus::InProgress,
+                };
+                (acp::ToolKind::Edit, title, status)
+            }
+            "mcpToolCall" => {
+                let server = item.get("server").and_then(|v| v.as_str()).unwrap_or("mcp");
+                let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
+                let title = format!("MCP: {server}.{tool}");
+                let status = item.get("status").and_then(|v| v.as_str());
+                let status = match status {
+                    Some("failed") => acp::ToolCallStatus::Failed,
+                    Some("completed") => acp::ToolCallStatus::Completed,
+                    _ => acp::ToolCallStatus::InProgress,
+                };
+                (acp::ToolKind::Fetch, title, status)
+            }
+            "webSearch" => {
+                let query = item.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let title = if query.is_empty() {
+                    "Web search".to_string()
+                } else {
+                    format!("Web search: {query}")
+                };
+                (acp::ToolKind::Search, title, acp::ToolCallStatus::Completed)
+            }
+            "imageView" => {
+                let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let title = if path.is_empty() {
+                    "View image".to_string()
+                } else {
+                    format!("View image: {path}")
+                };
+                (acp::ToolKind::Read, title, acp::ToolCallStatus::Completed)
+            }
+            "enteredReviewMode" => (
+                acp::ToolKind::Think,
+                "Entered review mode".to_string(),
+                acp::ToolCallStatus::Completed,
+            ),
+            "exitedReviewMode" => (
+                acp::ToolKind::Think,
+                "Exited review mode".to_string(),
+                acp::ToolCallStatus::Completed,
+            ),
+            "contextCompaction" => (
+                acp::ToolKind::Think,
+                "Context compaction".to_string(),
+                acp::ToolCallStatus::Completed,
+            ),
+            "collabAgentToolCall" => (
+                acp::ToolKind::Other,
+                "Collaborative tool call".to_string(),
+                acp::ToolCallStatus::Completed,
+            ),
+            _ => (
+                acp::ToolKind::Other,
+                "Tool call".to_string(),
+                acp::ToolCallStatus::Completed,
+            ),
+        }
+    }
+
+    async fn diff_content_from_file_change_item(
+        &self,
+        session_id: &acp::SessionId,
+        item: &serde_json::Value,
+    ) -> Option<Vec<acp::ToolCallContent>> {
+        let changes = item.get("changes").and_then(|v| v.as_array())?;
+
+        let cwd = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id.0.as_ref()).map(|s| s.cwd.clone())
+        };
+        let cwd = cwd.unwrap_or_else(|| ".".to_string());
+
+        let mut content = Vec::new();
+        for change in changes {
+            let Some(path) = change.get("path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let diff = change.get("diff").and_then(|v| v.as_str()).unwrap_or("");
+            let (old_text, new_text) = Self::unified_diff_to_old_new(diff);
+            let abs_path = std::path::PathBuf::from(&cwd).join(path);
+            let mut d = acp::Diff::new(abs_path, new_text);
+            if let Some(old) = old_text {
+                d = d.old_text(old);
+            }
+            content.push(acp::ToolCallContent::Diff(d));
+        }
+
+        if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        }
+    }
+
+    fn unified_diff_to_old_new(diff: &str) -> (Option<String>, String) {
+        let mut old_lines = Vec::new();
+        let mut new_lines = Vec::new();
+        let mut in_hunk = false;
+
+        for line in diff.lines() {
+            if line.starts_with("@@") {
+                in_hunk = true;
+                continue;
+            }
+            if !in_hunk {
+                continue;
+            }
+            if line.starts_with("\\ No newline") {
+                continue;
+            }
+            match line.chars().next() {
+                Some(' ') => {
+                    old_lines.push(line[1..].to_string());
+                    new_lines.push(line[1..].to_string());
+                }
+                Some('-') => old_lines.push(line[1..].to_string()),
+                Some('+') => new_lines.push(line[1..].to_string()),
+                _ => {}
+            }
+        }
+
+        let old = if old_lines.is_empty() {
+            None
+        } else {
+            Some(old_lines.join("\n"))
+        };
+        (old, new_lines.join("\n"))
+    }
+
+    fn strip_git_diff_path(path: &str) -> Option<String> {
+        if path == "/dev/null" {
+            return None;
+        }
+        Some(
+            path.strip_prefix("a/")
+                .or_else(|| path.strip_prefix("b/"))
+                .unwrap_or(path)
+                .to_string(),
+        )
+    }
+
+    fn diff_section_path(section: &str) -> Option<String> {
+        let mut old_path: Option<String> = None;
+        let mut new_path: Option<String> = None;
+
+        for line in section.lines() {
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                new_path = Self::strip_git_diff_path(rest.trim());
+            } else if let Some(rest) = line.strip_prefix("--- ") {
+                old_path = Self::strip_git_diff_path(rest.trim());
+            }
+        }
+
+        new_path.or(old_path)
+    }
+
+    fn split_unified_diff_sections(diff: &str) -> Vec<String> {
+        let mut sections: Vec<Vec<String>> = Vec::new();
+        let mut current: Vec<String> = Vec::new();
+
+        for line in diff.lines() {
+            if line.starts_with("diff --git ") && !current.is_empty() {
+                sections.push(current);
+                current = Vec::new();
+            }
+            current.push(line.to_string());
+        }
+        if !current.is_empty() {
+            sections.push(current);
+        }
+
+        if sections.is_empty() {
+            return vec![];
+        }
+
+        sections
+            .into_iter()
+            .map(|lines| lines.join("\n"))
+            .collect::<Vec<_>>()
+    }
+
+    fn diff_content_from_unified_diff(cwd: &str, diff: &str) -> Vec<acp::ToolCallContent> {
+        let mut content = Vec::new();
+
+        for section in Self::split_unified_diff_sections(diff) {
+            let Some(path) = Self::diff_section_path(&section) else {
+                continue;
+            };
+            let (old_text, new_text) = Self::unified_diff_to_old_new(&section);
+            let abs_path = std::path::PathBuf::from(cwd).join(path);
+            let mut d = acp::Diff::new(abs_path, new_text);
+            if let Some(old) = old_text {
+                d = d.old_text(old);
+            }
+            content.push(acp::ToolCallContent::Diff(d));
+        }
+
+        content
     }
 
     fn tool_call_id_string_for_codex_item(item_id: &str) -> String {
@@ -450,25 +1169,184 @@ impl acp::Agent for CodexAgent {
     ) -> Result<acp::InitializeResponse, acp::Error> {
         log::info!("Received initialize request");
 
+        let protocol_version = if request.protocol_version < acp::ProtocolVersion::V1 {
+            // Treat V0 (pre-release) as unsupported; respond with our supported version.
+            acp::ProtocolVersion::V1
+        } else {
+            std::cmp::min(request.protocol_version, acp::ProtocolVersion::LATEST)
+        };
+
         // Build capabilities
-        let prompt_caps = acp::PromptCapabilities::new().embedded_context(true);
-        let agent_caps = acp::AgentCapabilities::new().prompt_capabilities(prompt_caps);
+        let prompt_caps = acp::PromptCapabilities::new()
+            .embedded_context(true)
+            .image(true);
+        let mut agent_caps = acp::AgentCapabilities::new()
+            .prompt_capabilities(prompt_caps)
+            .mcp_capabilities(acp::McpCapabilities::new())
+            .load_session(true);
+        agent_caps.session_capabilities =
+            acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new());
+
+        let mut auth_methods = vec![
+            acp::AuthMethod::new("chatgpt", "Login with ChatGPT")
+                .description("Browser-based login for Codex CLI (ChatGPT account)."),
+            acp::AuthMethod::new("codex-api-key", "Use CODEX_API_KEY")
+                .description("Requires setting the CODEX_API_KEY environment variable."),
+            acp::AuthMethod::new("openai-api-key", "Use OPENAI_API_KEY")
+                .description("Requires setting the OPENAI_API_KEY environment variable."),
+        ];
+        // Headless environments may not be able to complete browser login.
+        if std::env::var("NO_BROWSER").is_ok() {
+            auth_methods.retain(|m| m.id.0.as_ref() != "chatgpt");
+        }
 
         // Build agent info
         let agent_info = acp::Implementation::new("seren-acp-codex", env!("CARGO_PKG_VERSION"))
             .title("Codex Agent".to_string());
 
-        Ok(acp::InitializeResponse::new(request.protocol_version)
+        Ok(acp::InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_caps)
-            .agent_info(agent_info))
+            .agent_info(agent_info)
+            .auth_methods(auth_methods))
     }
 
     async fn authenticate(
         &self,
-        _request: acp::AuthenticateRequest,
+        request: acp::AuthenticateRequest,
     ) -> Result<acp::AuthenticateResponse, acp::Error> {
         log::info!("Received authenticate request");
-        Ok(acp::AuthenticateResponse::default())
+
+        fn open_auth_url(url: &str) {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg(url).spawn();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", "start", url])
+                    .spawn();
+            }
+        }
+
+        let codex = self.get_codex(None).await?;
+
+        // If we're already authenticated with a compatible method, treat this as a no-op.
+        if let Ok(account) = codex.account_read(false).await {
+            let current_type = account
+                .get("account")
+                .and_then(|v| v.as_object())
+                .and_then(|a| a.get("type"))
+                .and_then(|t| t.as_str());
+            match (current_type, request.method_id.0.as_ref()) {
+                (Some("chatgpt"), "chatgpt") => return Ok(acp::AuthenticateResponse::new()),
+                (Some("apiKey"), "codex-api-key" | "openai-api-key") => {
+                    return Ok(acp::AuthenticateResponse::new());
+                }
+                _ => {}
+            }
+        }
+
+        match request.method_id.0.as_ref() {
+            "chatgpt" => {
+                // Subscribe before initiating the login so we don't miss the completion event.
+                let mut rx = codex.subscribe();
+                let result = codex
+                    .account_login_start(serde_json::json!({ "type": "chatgpt" }))
+                    .await
+                    .map_err(|e| acp::Error::new(-32603, format!("Failed to start login: {e}")))?;
+
+                let auth_url = result
+                    .get("authUrl")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        acp::Error::new(-32603, "Codex login response missing authUrl")
+                    })?;
+                let login_id = result
+                    .get("loginId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        acp::Error::new(-32603, "Codex login response missing loginId")
+                    })?;
+
+                log::info!("Starting browser login flow for Codex (loginId={login_id})");
+                open_auth_url(auth_url);
+
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(10 * 60);
+                loop {
+                    let recv = tokio::time::timeout_at(deadline, rx.recv()).await;
+                    let notif = match recv {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                            return Err(acp::Error::new(-32603, "Codex process closed"));
+                        }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                        Err(_) => {
+                            let _ = codex.account_login_cancel(login_id).await;
+                            return Err(acp::Error::new(-32603, "Login timed out"));
+                        }
+                    };
+
+                    if notif.method != "account/login/completed" {
+                        continue;
+                    }
+                    let Some(params) = notif.params.as_ref() else {
+                        continue;
+                    };
+
+                    // Ignore completion notifications for other login attempts.
+                    let completed_login_id =
+                        params.get("loginId").and_then(|v| v.as_str()).unwrap_or("");
+                    if completed_login_id != login_id {
+                        continue;
+                    }
+
+                    let success = params
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if success {
+                        return Ok(acp::AuthenticateResponse::new());
+                    }
+                    let error = params
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Login failed");
+                    return Err(acp::Error::new(-32603, error));
+                }
+            }
+            "codex-api-key" => {
+                let api_key = std::env::var("CODEX_API_KEY").map_err(|_| {
+                    acp::Error::internal_error()
+                        .data(serde_json::Value::String("CODEX_API_KEY is not set".into()))
+                })?;
+                codex
+                    .account_login_start(serde_json::json!({ "type": "apiKey", "apiKey": api_key }))
+                    .await
+                    .map_err(|e| acp::Error::new(-32603, format!("Failed to login: {e}")))?;
+                Ok(acp::AuthenticateResponse::new())
+            }
+            "openai-api-key" => {
+                let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+                    acp::Error::internal_error().data(serde_json::Value::String(
+                        "OPENAI_API_KEY is not set".into(),
+                    ))
+                })?;
+                codex
+                    .account_login_start(serde_json::json!({ "type": "apiKey", "apiKey": api_key }))
+                    .await
+                    .map_err(|e| acp::Error::new(-32603, format!("Failed to login: {e}")))?;
+                Ok(acp::AuthenticateResponse::new())
+            }
+            _ => Err(acp::Error::invalid_params().data(serde_json::Value::String(
+                "Unsupported authentication method".into(),
+            ))),
+        }
     }
 
     async fn new_session(
@@ -476,44 +1354,61 @@ impl acp::Agent for CodexAgent {
         request: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
         log::info!("Received new session request for cwd: {:?}", request.cwd);
-        log::info!(
-            "MCP servers from client: {}",
-            request.mcp_servers.len()
-        );
+        log::info!("MCP servers from client: {}", request.mcp_servers.len());
 
         // Convert ACP MCP servers to Codex config format
         let mcp_servers = convert_acp_mcp_to_codex(&request.mcp_servers);
 
         let codex = self.get_codex(mcp_servers).await?;
 
+        // Ensure we are authenticated if Codex requires it.
+        self.ensure_authenticated(&codex).await?;
+
         // Start a Codex thread
         let cwd = request.cwd.to_string_lossy().to_string();
-        let approval_policy = Self::approval_policy_for_mode("ask");
+        let default_approval_policy = Self::approval_policy_for_mode("ask");
         let thread_params = ThreadStartParams {
             cwd: Some(cwd.clone()),
             model: None,
             model_provider: None,
-            approval_policy: Some(approval_policy),
+            approval_policy: Some(default_approval_policy),
             sandbox: Some(SandboxMode::WorkspaceWrite),
             config: None,
             base_instructions: None,
             developer_instructions: None,
         };
 
-        let thread_id = codex
-            .thread_start(thread_params)
+        let thread_start = codex
+            .thread_start_full(thread_params)
             .await
             .map_err(|e| acp::Error::new(-32603, format!("Failed to start Codex thread: {}", e)))?;
 
+        let thread_id = thread_start
+            .get("thread")
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| acp::Error::new(-32603, "No thread.id in response"))?
+            .to_string();
+
+        let approval_policy = thread_start
+            .get("approvalPolicy")
+            .and_then(|v| v.as_str())
+            .and_then(Self::parse_approval_policy)
+            .unwrap_or(default_approval_policy);
+
+        let model = thread_start
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let reasoning_effort = thread_start
+            .get("reasoningEffort")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         log::info!("Created Codex thread {} for cwd {}", thread_id, cwd);
 
-        // Generate session ID
-        let session_id = {
-            let mut counter = self.next_session_id.write().await;
-            let id = *counter;
-            *counter += 1;
-            format!("session-{}", id)
-        };
+        // Use the Codex thread id as the ACP session id so it can be persisted and reloaded.
+        let session_id = thread_id.clone();
 
         // Store session mapping
         {
@@ -521,25 +1416,100 @@ impl acp::Agent for CodexAgent {
             sessions.insert(
                 session_id.clone(),
                 SessionData {
-                    thread_id,
+                    thread_id: thread_id.clone(),
                     current_turn_id: None,
                     cwd,
                     approval_policy,
+                    model: model.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
+                    last_turn_diff: None,
                     known_tool_calls: HashSet::new(),
                 },
             );
         }
 
-        Ok(acp::NewSessionResponse::new(session_id).modes(Self::session_modes()))
+        let models = self.build_model_state(&codex, model.as_deref()).await?;
+        let config_options = self
+            .build_config_options(&codex, model.as_deref(), reasoning_effort.as_deref())
+            .await?;
+
+        Ok(acp::NewSessionResponse::new(session_id)
+            .modes(Self::session_modes())
+            .models(models)
+            .config_options(config_options))
     }
 
     async fn load_session(
         &self,
-        _request: acp::LoadSessionRequest,
+        request: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
         log::info!("Received load session request");
-        // Codex doesn't support loading existing sessions
-        Err(acp::Error::new(-32603, "Session loading not supported"))
+
+        // Convert ACP MCP servers to Codex config format (only used on first connect).
+        let mcp_servers = convert_acp_mcp_to_codex(&request.mcp_servers);
+        let codex = self.get_codex(mcp_servers).await?;
+
+        self.ensure_authenticated(&codex).await?;
+
+        let thread_id: String = request.session_id.0.as_ref().to_string();
+        let cwd = request.cwd.to_string_lossy().to_string();
+
+        let resume = codex
+            .thread_resume(crate::codex::ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                cwd: Some(cwd.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to resume thread: {e}")))?;
+
+        let approval_policy = resume
+            .get("approvalPolicy")
+            .and_then(|v| v.as_str())
+            .and_then(Self::parse_approval_policy)
+            .unwrap_or(Self::approval_policy_for_mode("ask"));
+        let model = resume
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let reasoning_effort = resume
+            .get("reasoningEffort")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Store session mapping (session id == thread id).
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(
+                thread_id.clone(),
+                SessionData {
+                    thread_id: thread_id.clone(),
+                    current_turn_id: None,
+                    cwd: cwd.clone(),
+                    approval_policy,
+                    model: model.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
+                    last_turn_diff: None,
+                    known_tool_calls: HashSet::new(),
+                },
+            );
+        }
+
+        // Replay history to the client.
+        if let Some(thread) = resume.get("thread") {
+            self.replay_thread_items(&request.session_id, thread)
+                .await?;
+        }
+
+        let models = self.build_model_state(&codex, model.as_deref()).await?;
+        let config_options = self
+            .build_config_options(&codex, model.as_deref(), reasoning_effort.as_deref())
+            .await?;
+
+        Ok(acp::LoadSessionResponse::new()
+            .modes(Self::session_modes())
+            .models(models)
+            .config_options(config_options))
     }
 
     async fn prompt(&self, request: acp::PromptRequest) -> Result<acp::PromptResponse, acp::Error> {
@@ -551,35 +1521,28 @@ impl acp::Agent for CodexAgent {
         let codex = self.get_codex(None).await?;
 
         // Get thread ID and session config for this session
-        let (thread_id, approval_policy) = {
+        let (thread_id, approval_policy, model, reasoning_effort) = {
             let sessions = self.sessions.read().await;
             let session_id_str: &str = &request.session_id.0;
             sessions
                 .get(session_id_str)
-                .map(|s| (s.thread_id.clone(), s.approval_policy))
+                .map(|s| {
+                    (
+                        s.thread_id.clone(),
+                        s.approval_policy,
+                        s.model.clone(),
+                        s.reasoning_effort.clone(),
+                    )
+                })
                 .ok_or_else(|| {
                     acp::Error::new(-32603, format!("Session not found: {}", session_id_str))
                 })?
         };
 
-        // Extract prompt text from content blocks and convert to UserInput
-        let user_input: Vec<UserInput> = request
-            .prompt
-            .iter()
-            .filter_map(|block| {
-                if let acp::ContentBlock::Text(text) = block {
-                    Some(UserInput::Text {
-                        text: text.text.clone(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if user_input.is_empty() {
-            return Err(acp::Error::new(-32602, "No text content in prompt"));
-        }
+        // Convert ACP content blocks to Codex user input.
+        let user_input = self
+            .content_blocks_to_user_input(&request.session_id, &request.prompt)
+            .await?;
 
         log::debug!(
             "Sending prompt to Codex thread {}: {:?}",
@@ -592,7 +1555,14 @@ impl acp::Agent for CodexAgent {
 
         // Start turn with user input
         let turn_id = codex
-            .turn_start_with_policy(&thread_id, user_input, Some(approval_policy))
+            .turn_start_with_overrides(
+                &thread_id,
+                user_input,
+                Some(approval_policy),
+                model.clone(),
+                reasoning_effort.clone(),
+                None,
+            )
             .await
             .map_err(|e| acp::Error::new(-32603, format!("Failed to start turn: {}", e)))?;
 
@@ -602,6 +1572,7 @@ impl acp::Agent for CodexAgent {
             let session_id_str: &str = &request.session_id.0;
             if let Some(session) = sessions.get_mut(session_id_str) {
                 session.current_turn_id = Some(turn_id.clone());
+                session.last_turn_diff = None;
             }
         }
 
@@ -648,25 +1619,148 @@ impl acp::Agent for CodexAgent {
                 continue;
             }
 
+            if notif.method == "item/mcpToolCall/progress" {
+                let item_id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or("");
+                let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                if !item_id.is_empty() {
+                    let tool_call_id_str = Self::tool_call_id_string_for_codex_item(item_id);
+                    let tool_call_id = acp::ToolCallId::new(tool_call_id_str.clone());
+
+                    // Ensure a tool call exists for progress updates.
+                    let first_seen = {
+                        let mut sessions = self.sessions.write().await;
+                        let session_id_str: &str = &request.session_id.0;
+                        sessions
+                            .get_mut(session_id_str)
+                            .map(|s| s.known_tool_calls.insert(tool_call_id_str))
+                            .unwrap_or(true)
+                    };
+                    if first_seen {
+                        let _ = self
+                            .emit_session_update(
+                                request.session_id.clone(),
+                                acp::SessionUpdate::ToolCall(
+                                    acp::ToolCall::new(tool_call_id.clone(), "MCP tool call")
+                                        .kind(acp::ToolKind::Fetch)
+                                        .status(acp::ToolCallStatus::InProgress),
+                                ),
+                            )
+                            .await;
+                    }
+
+                    let title = if message.is_empty() {
+                        None
+                    } else {
+                        Some(format!("MCP: {message}"))
+                    };
+                    let mut fields = acp::ToolCallUpdateFields::new()
+                        .kind(acp::ToolKind::Fetch)
+                        .status(acp::ToolCallStatus::InProgress);
+                    if let Some(t) = title {
+                        fields = fields.title(t);
+                    }
+                    let _ = self
+                        .emit_session_update(
+                            request.session_id.clone(),
+                            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                                tool_call_id,
+                                fields,
+                            )),
+                        )
+                        .await;
+                }
+                continue;
+            }
+
+            if notif.method == "turn/diff/updated" {
+                let diff = params.get("diff").and_then(|v| v.as_str()).unwrap_or("");
+                let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+                if !diff.is_empty() && !turn_id.is_empty() {
+                    let (should_emit, cwd) = {
+                        let mut sessions = self.sessions.write().await;
+                        let session_id_str: &str = &request.session_id.0;
+                        match sessions.get_mut(session_id_str) {
+                            Some(session) => {
+                                if session.last_turn_diff.as_deref() == Some(diff) {
+                                    (false, session.cwd.clone())
+                                } else {
+                                    session.last_turn_diff = Some(diff.to_string());
+                                    (true, session.cwd.clone())
+                                }
+                            }
+                            None => (false, ".".to_string()),
+                        }
+                    };
+
+                    if should_emit {
+                        let tool_call_id_str = format!("codex-turn-diff:{turn_id}");
+                        let tool_call_id = acp::ToolCallId::new(tool_call_id_str.clone());
+
+                        let first_seen = {
+                            let mut sessions = self.sessions.write().await;
+                            let session_id_str: &str = &request.session_id.0;
+                            sessions
+                                .get_mut(session_id_str)
+                                .map(|s| s.known_tool_calls.insert(tool_call_id_str))
+                                .unwrap_or(true)
+                        };
+                        if first_seen {
+                            let _ = self
+                                .emit_session_update(
+                                    request.session_id.clone(),
+                                    acp::SessionUpdate::ToolCall(
+                                        acp::ToolCall::new(tool_call_id.clone(), "Diff")
+                                            .kind(acp::ToolKind::Edit)
+                                            .status(acp::ToolCallStatus::InProgress)
+                                            .raw_input(serde_json::Value::String(diff.to_string())),
+                                    ),
+                                )
+                                .await;
+                        }
+
+                        let content = Self::diff_content_from_unified_diff(&cwd, diff);
+                        let mut fields = acp::ToolCallUpdateFields::new()
+                            .kind(acp::ToolKind::Edit)
+                            .status(acp::ToolCallStatus::InProgress)
+                            .raw_output(serde_json::Value::String(diff.to_string()));
+                        if !content.is_empty() {
+                            fields = fields.content(content);
+                        }
+                        let _ = self
+                            .emit_session_update(
+                                request.session_id.clone(),
+                                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                                    tool_call_id,
+                                    fields,
+                                )),
+                            )
+                            .await;
+                    }
+                }
+                continue;
+            }
+
             if notif.method == "item/started" || notif.method == "item/completed" {
                 if let Some(item) = params.get("item").and_then(|v| v.as_object()) {
                     let item_id = item.get("id").and_then(|v| v.as_str());
                     let item_type = item.get("type").and_then(|v| v.as_str());
                     if let (Some(item_id), Some(item_type)) = (item_id, item_type) {
-                        let (kind, title) = match item_type {
-                            "commandExecution" => {
-                                let command =
-                                    item.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                                let title = if command.is_empty() {
-                                    "Run command".to_string()
-                                } else {
-                                    format!("Run command: {command}")
-                                };
-                                (acp::ToolKind::Execute, title)
-                            }
-                            "fileChange" => (acp::ToolKind::Edit, "Apply file changes".to_string()),
+                        match item_type {
+                            "commandExecution"
+                            | "fileChange"
+                            | "mcpToolCall"
+                            | "webSearch"
+                            | "imageView"
+                            | "enteredReviewMode"
+                            | "exitedReviewMode"
+                            | "contextCompaction"
+                            | "collabAgentToolCall" => {}
                             _ => continue,
                         };
+
+                        let item_value = serde_json::Value::Object(item.clone());
+                        let (kind, title, computed_status) =
+                            Self::tool_call_fields_for_item(item_type, &item_value);
 
                         let tool_call_id_str = Self::tool_call_id_string_for_codex_item(item_id);
                         let tool_call_id = acp::ToolCallId::new(tool_call_id_str.clone());
@@ -688,25 +1782,41 @@ impl acp::Agent for CodexAgent {
                                         acp::ToolCall::new(tool_call_id.clone(), title)
                                             .kind(kind)
                                             .status(acp::ToolCallStatus::InProgress)
-                                            .raw_input(serde_json::Value::Object(item.clone())),
+                                            .raw_input(item_value.clone()),
                                     ),
                                 )
                                 .await;
                         }
 
-                        let status = match notif.method.as_str() {
-                            "item/started" => acp::ToolCallStatus::InProgress,
-                            "item/completed" => acp::ToolCallStatus::Completed,
-                            _ => acp::ToolCallStatus::Completed,
+                        let status = if notif.method == "item/started" {
+                            acp::ToolCallStatus::InProgress
+                        } else {
+                            computed_status
                         };
+
+                        let mut fields = acp::ToolCallUpdateFields::new()
+                            .kind(kind)
+                            .status(status)
+                            .raw_output(item_value.clone());
+
+                        if item_type == "fileChange" {
+                            if let Some(content) = self
+                                .diff_content_from_file_change_item(
+                                    &request.session_id,
+                                    &item_value,
+                                )
+                                .await
+                            {
+                                fields = fields.content(content);
+                            }
+                        }
+
                         let _ = self
                             .emit_session_update(
                                 request.session_id.clone(),
                                 acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
                                     tool_call_id,
-                                    acp::ToolCallUpdateFields::new()
-                                        .status(status)
-                                        .raw_output(serde_json::Value::Object(item.clone())),
+                                    fields,
                                 )),
                             )
                             .await;
@@ -753,6 +1863,22 @@ impl acp::Agent for CodexAgent {
 
             if notif.method == "turn/completed" {
                 if let Some(turn) = params.get("turn") {
+                    if let Some(turn_id) = turn.get("id").and_then(|v| v.as_str()) {
+                        // Best-effort: mark the streamed diff tool call as completed.
+                        let tool_call_id =
+                            acp::ToolCallId::new(format!("codex-turn-diff:{turn_id}"));
+                        let _ = self
+                            .emit_session_update(
+                                request.session_id.clone(),
+                                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                                    tool_call_id,
+                                    acp::ToolCallUpdateFields::new()
+                                        .kind(acp::ToolKind::Edit)
+                                        .status(acp::ToolCallStatus::Completed),
+                                )),
+                            )
+                            .await;
+                    }
                     if let Some(status) = turn.get("status").and_then(|v| v.as_str()) {
                         stop_reason = match status {
                             "interrupted" => acp::StopReason::Cancelled,
@@ -782,29 +1908,27 @@ impl acp::Agent for CodexAgent {
             request.session_id
         );
 
-        let codex = self.get_codex(None).await?;
+        let Ok(codex) = self.get_codex(None).await else {
+            // If Codex isn't running yet, there can't be an active turn to interrupt.
+            return Ok(());
+        };
 
-        // Get thread ID and turn ID for this session
+        // Get thread ID and turn ID for this session (best-effort).
         let (thread_id, turn_id) = {
             let sessions = self.sessions.read().await;
             let session_id_str: &str = &request.session_id.0;
-            let session = sessions.get(session_id_str).ok_or_else(|| {
-                acp::Error::new(-32603, format!("Session not found: {}", session_id_str))
-            })?;
-
-            let turn_id = session
-                .current_turn_id
-                .clone()
-                .ok_or_else(|| acp::Error::new(-32603, "No active turn to cancel"))?;
-
+            let Some(session) = sessions.get(session_id_str) else {
+                return Ok(());
+            };
+            let Some(turn_id) = session.current_turn_id.clone() else {
+                return Ok(());
+            };
             (session.thread_id.clone(), turn_id)
         };
 
-        codex
-            .turn_interrupt(&thread_id, &turn_id)
-            .await
-            .map_err(|e| acp::Error::new(-32603, format!("Failed to cancel: {}", e)))?;
-
+        if let Err(e) = codex.turn_interrupt(&thread_id, &turn_id).await {
+            log::warn!("Failed to interrupt Codex turn (best-effort): {e}");
+        }
         Ok(())
     }
 
@@ -828,6 +1952,129 @@ impl acp::Agent for CodexAgent {
 
         // Codex app-server applies turn config when starting a new turn; no immediate RPC needed.
         Ok(acp::SetSessionModeResponse::default())
+    }
+
+    async fn set_session_model(
+        &self,
+        request: acp::SetSessionModelRequest,
+    ) -> Result<acp::SetSessionModelResponse, acp::Error> {
+        log::info!(
+            "Received set session model request: session={}, model={}",
+            request.session_id.0,
+            request.model_id.0
+        );
+
+        {
+            let mut sessions = self.sessions.write().await;
+            let session_id_str: &str = &request.session_id.0;
+            let session = sessions.get_mut(session_id_str).ok_or_else(|| {
+                acp::Error::new(-32603, format!("Session not found: {}", session_id_str))
+            })?;
+            session.model = Some(request.model_id.0.as_ref().to_string());
+        }
+
+        Ok(acp::SetSessionModelResponse::default())
+    }
+
+    async fn set_session_config_option(
+        &self,
+        request: acp::SetSessionConfigOptionRequest,
+    ) -> Result<acp::SetSessionConfigOptionResponse, acp::Error> {
+        log::info!(
+            "Received set session config option: session={}, config={}, value={}",
+            request.session_id.0,
+            request.config_id.0,
+            request.value.0
+        );
+
+        let (model, reasoning_effort) = {
+            let mut sessions = self.sessions.write().await;
+            let session_id_str: &str = &request.session_id.0;
+            let session = sessions.get_mut(session_id_str).ok_or_else(|| {
+                acp::Error::new(-32603, format!("Session not found: {}", session_id_str))
+            })?;
+
+            match request.config_id.0.as_ref() {
+                "reasoning_effort" => {
+                    session.reasoning_effort = Some(request.value.0.as_ref().to_string());
+                }
+                _ => {
+                    return Err(acp::Error::invalid_params().data(serde_json::Value::String(
+                        "Unsupported config option".into(),
+                    )));
+                }
+            }
+
+            (session.model.clone(), session.reasoning_effort.clone())
+        };
+
+        let codex = self.get_codex(None).await?;
+        let config_options = self
+            .build_config_options(&codex, model.as_deref(), reasoning_effort.as_deref())
+            .await?;
+
+        Ok(acp::SetSessionConfigOptionResponse::new(config_options))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: acp::ListSessionsRequest,
+    ) -> Result<acp::ListSessionsResponse, acp::Error> {
+        log::info!("Received list sessions request");
+
+        let codex = self.get_codex(None).await?;
+        self.ensure_authenticated(&codex).await?;
+
+        let raw = codex
+            .thread_list(
+                request.cursor.clone(),
+                Some(25),
+                Some("updated_at".to_string()),
+            )
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to list threads: {e}")))?;
+
+        let filter_cwd = request
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
+        let mut sessions = Vec::new();
+        if let Some(items) = raw.get("data").and_then(|v| v.as_array()) {
+            for t in items {
+                let Some(id) = t.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(cwd) = t.get("cwd").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if let Some(ref fcwd) = filter_cwd {
+                    if cwd != fcwd {
+                        continue;
+                    }
+                }
+                let title = t
+                    .get("preview")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let updated_at = t
+                    .get("updatedAt")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                sessions.push(
+                    acp::SessionInfo::new(acp::SessionId::new(id.to_string()), cwd.to_string())
+                        .title(title)
+                        .updated_at(updated_at),
+                );
+            }
+        }
+
+        let next_cursor = raw
+            .get("nextCursor")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(acp::ListSessionsResponse::new(sessions).next_cursor(next_cursor))
     }
 
     async fn ext_method(&self, _request: acp::ExtRequest) -> Result<acp::ExtResponse, acp::Error> {
@@ -857,6 +2104,11 @@ fn convert_codex_notification(
             Some(acp::SessionUpdate::AgentThoughtChunk(content))
         }
         "item/commandExecution/outputDelta" => {
+            let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            let content = acp::ContentChunk::new(delta.to_string().into());
+            Some(acp::SessionUpdate::AgentMessageChunk(content))
+        }
+        "item/fileChange/outputDelta" => {
             let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             let content = acp::ContentChunk::new(delta.to_string().into());
             Some(acp::SessionUpdate::AgentMessageChunk(content))
