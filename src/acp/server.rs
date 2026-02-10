@@ -1644,6 +1644,13 @@ impl acp::Agent for CodexAgent {
         let mut rx = codex.subscribe();
 
         // Start turn with user input
+        log::info!(
+            "Starting Codex turn: thread_id={}, model={}, reasoning_effort={}, approval_policy={:?}",
+            thread_id,
+            model.as_deref().unwrap_or("<default>"),
+            reasoning_effort.as_deref().unwrap_or("<default>"),
+            approval_policy
+        );
         let turn_id = codex
             .turn_start_with_overrides(
                 &thread_id,
