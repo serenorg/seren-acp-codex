@@ -2119,6 +2119,17 @@ impl acp::Agent for CodexAgent {
             }
         }
 
+        // Inform the client that config options (and current values) may have changed as a result
+        // of selecting a different model.
+        let _ = self
+            .emit_session_update(
+                request.session_id.clone(),
+                acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(
+                    config_options,
+                )),
+            )
+            .await;
+
         Ok(acp::SetSessionModelResponse::default())
     }
 
@@ -2168,6 +2179,17 @@ impl acp::Agent for CodexAgent {
                 session.reasoning_effort = Some(resolved_effort);
             }
         }
+
+        // The client doesn't necessarily read the RPC response body; send an update so the UI can
+        // reflect clamped values and any option list changes.
+        let _ = self
+            .emit_session_update(
+                request.session_id.clone(),
+                acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(
+                    config_options.clone(),
+                )),
+            )
+            .await;
 
         Ok(acp::SetSessionConfigOptionResponse::new(config_options))
     }
