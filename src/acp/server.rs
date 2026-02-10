@@ -382,6 +382,7 @@ impl CodexAgent {
         let items = raw.get("data").and_then(|v| v.as_array());
 
         let mut supported_efforts: Vec<acp::SessionConfigSelectOption> = Vec::new();
+        let mut supported_effort_ids: Vec<String> = Vec::new();
         let mut default_effort: Option<String> = None;
 
         let mut model_match = None;
@@ -428,6 +429,7 @@ impl CodexAgent {
                         entry = entry.description(d);
                     }
                     supported_efforts.push(entry);
+                    supported_effort_ids.push(effort.to_string());
                 }
             }
         }
@@ -438,13 +440,19 @@ impl CodexAgent {
                     effort,
                     effort.to_string(),
                 ));
+                supported_effort_ids.push(effort.to_string());
             }
         }
 
-        let chosen_effort = current_effort
+        let desired_effort = current_effort
             .map(|s| s.to_string())
-            .or(default_effort)
+            .or_else(|| default_effort.clone())
             .unwrap_or_else(|| "medium".to_string());
+        let chosen_effort = Self::choose_supported_effort(
+            desired_effort,
+            default_effort.as_deref(),
+            &supported_effort_ids,
+        );
 
         let reasoning = acp::SessionConfigOption::select(
             "reasoning_effort",
@@ -456,6 +464,74 @@ impl CodexAgent {
         .description("Codex reasoning effort override for this session.");
 
         Ok(vec![reasoning])
+    }
+
+    fn reasoning_effort_rank(effort: &str) -> Option<u8> {
+        match effort {
+            "none" => Some(0),
+            "minimal" => Some(1),
+            "low" => Some(2),
+            "medium" => Some(3),
+            "high" => Some(4),
+            "xhigh" => Some(5),
+            _ => None,
+        }
+    }
+
+    fn choose_supported_effort(
+        desired: String,
+        default_effort: Option<&str>,
+        supported: &[String],
+    ) -> String {
+        if supported.is_empty() {
+            return desired;
+        }
+        if supported.iter().any(|v| v == &desired) {
+            return desired;
+        }
+
+        // Prefer the closest supported effort that is <= desired (so "xhigh" becomes "high").
+        if let Some(dr) = Self::reasoning_effort_rank(&desired) {
+            let mut best: Option<(u8, &String)> = None;
+            for v in supported {
+                let Some(r) = Self::reasoning_effort_rank(v) else {
+                    continue;
+                };
+                if r <= dr {
+                    best = match best {
+                        None => Some((r, v)),
+                        Some((best_r, _)) if r > best_r => Some((r, v)),
+                        Some(prev) => Some(prev),
+                    };
+                }
+            }
+            if let Some((_, v)) = best {
+                return v.clone();
+            }
+        }
+
+        // Fall back to model default if present, otherwise the first option.
+        if let Some(def) = default_effort {
+            if supported.iter().any(|v| v == def) {
+                return def.to_string();
+            }
+        }
+        supported[0].clone()
+    }
+
+    fn extract_reasoning_effort_from_config_options(
+        config_options: &[acp::SessionConfigOption],
+    ) -> Option<String> {
+        for opt in config_options {
+            if opt.id.0.as_ref() != "reasoning_effort" {
+                continue;
+            }
+            let acp::SessionConfigKind::Select(sel) = &opt.kind else {
+                continue;
+            };
+            return Some(sel.current_value.0.as_ref().to_string());
+        }
+        None
     }
 
     async fn replay_thread_items(
@@ -1410,6 +1486,16 @@ impl acp::Agent for CodexAgent {
         // Use the Codex thread id as the ACP session id so it can be persisted and reloaded.
         let session_id = thread_id.clone();
 
+        let models = self.build_model_state(&codex, model.as_deref()).await?;
+        let config_options = self
+            .build_config_options(&codex, model.as_deref(), reasoning_effort.as_deref())
+            .await?;
+
+        // Clamp any stale/unsupported effort to a supported value for this model.
+        let resolved_reasoning_effort =
+            Self::extract_reasoning_effort_from_config_options(&config_options)
+                .or(reasoning_effort.clone());
+
         // Store session mapping
         {
             let mut sessions = self.sessions.write().await;
@@ -1421,17 +1507,12 @@ impl acp::Agent for CodexAgent {
                     cwd,
                     approval_policy,
                     model: model.clone(),
-                    reasoning_effort: reasoning_effort.clone(),
+                    reasoning_effort: resolved_reasoning_effort,
                     last_turn_diff: None,
                     known_tool_calls: HashSet::new(),
                 },
             );
         }
-
-        let models = self.build_model_state(&codex, model.as_deref()).await?;
-        let config_options = self
-            .build_config_options(&codex, model.as_deref(), reasoning_effort.as_deref())
-            .await?;
 
         Ok(acp::NewSessionResponse::new(session_id)
             .modes(Self::session_modes())
@@ -1506,6 +1587,15 @@ impl acp::Agent for CodexAgent {
             .build_config_options(&codex, model.as_deref(), reasoning_effort.as_deref())
             .await?;
 
+        if let Some(resolved_effort) =
+            Self::extract_reasoning_effort_from_config_options(&config_options)
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(thread_id.as_str()) {
+                session.reasoning_effort = Some(resolved_effort);
+            }
+        }
+
         Ok(acp::LoadSessionResponse::new()
             .modes(Self::session_modes())
             .models(models)
@@ -1578,6 +1668,7 @@ impl acp::Agent for CodexAgent {
 
         // Forward notifications until this turn completes.
         let mut stop_reason = acp::StopReason::EndTurn;
+        let mut turn_failure: Option<acp::Error> = None;
         loop {
             let notif = match rx.recv().await {
                 Ok(n) => n,
@@ -1880,10 +1971,44 @@ impl acp::Agent for CodexAgent {
                             .await;
                     }
                     if let Some(status) = turn.get("status").and_then(|v| v.as_str()) {
-                        stop_reason = match status {
-                            "interrupted" => acp::StopReason::Cancelled,
-                            _ => acp::StopReason::EndTurn,
-                        };
+                        match status {
+                            "interrupted" => {
+                                stop_reason = acp::StopReason::Cancelled;
+                            }
+                            "failed" => {
+                                let err_obj = turn.get("error").cloned();
+                                let message = turn
+                                    .get("error")
+                                    .and_then(|e| e.get("message"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Codex turn failed");
+                                let additional_details = turn
+                                    .get("error")
+                                    .and_then(|e| e.get("additionalDetails"))
+                                    .and_then(|v| v.as_str());
+
+                                let mut full_message = message.to_string();
+                                if let Some(details) = additional_details {
+                                    full_message.push_str("\n\n");
+                                    full_message.push_str(details);
+                                }
+
+                                let mut err = acp::Error::new(
+                                    -32603,
+                                    format!("Codex turn failed: {full_message}"),
+                                );
+                                if let Some(obj) = err_obj {
+                                    if !obj.is_null() {
+                                        err = err.data(obj);
+                                    }
+                                }
+                                turn_failure = Some(err);
+                                stop_reason = acp::StopReason::EndTurn;
+                            }
+                            _ => {
+                                stop_reason = acp::StopReason::EndTurn;
+                            }
+                        }
                     }
                 }
                 break;
@@ -1897,6 +2022,10 @@ impl acp::Agent for CodexAgent {
             if let Some(session) = sessions.get_mut(session_id_str) {
                 session.current_turn_id = None;
             }
+        }
+
+        if let Some(err) = turn_failure {
+            return Err(err);
         }
 
         Ok(acp::PromptResponse::new(stop_reason))
@@ -1964,13 +2093,30 @@ impl acp::Agent for CodexAgent {
             request.model_id.0
         );
 
-        {
+        let (model, reasoning_effort) = {
             let mut sessions = self.sessions.write().await;
             let session_id_str: &str = &request.session_id.0;
             let session = sessions.get_mut(session_id_str).ok_or_else(|| {
                 acp::Error::new(-32603, format!("Session not found: {}", session_id_str))
             })?;
             session.model = Some(request.model_id.0.as_ref().to_string());
+            (session.model.clone(), session.reasoning_effort.clone())
+        };
+
+        // Clamp reasoning effort to something supported by the newly selected model so we don't
+        // persist a value that will later cause a 400 from Codex (e.g. "xhigh" with mini models).
+        let codex = self.get_codex(None).await?;
+        let config_options = self
+            .build_config_options(&codex, model.as_deref(), reasoning_effort.as_deref())
+            .await?;
+        if let Some(resolved_effort) =
+            Self::extract_reasoning_effort_from_config_options(&config_options)
+        {
+            let mut sessions = self.sessions.write().await;
+            let session_id_str: &str = &request.session_id.0;
+            if let Some(session) = sessions.get_mut(session_id_str) {
+                session.reasoning_effort = Some(resolved_effort);
+            }
         }
 
         Ok(acp::SetSessionModelResponse::default())
@@ -2012,6 +2158,16 @@ impl acp::Agent for CodexAgent {
         let config_options = self
             .build_config_options(&codex, model.as_deref(), reasoning_effort.as_deref())
             .await?;
+
+        if let Some(resolved_effort) =
+            Self::extract_reasoning_effort_from_config_options(&config_options)
+        {
+            let mut sessions = self.sessions.write().await;
+            let session_id_str: &str = &request.session_id.0;
+            if let Some(session) = sessions.get_mut(session_id_str) {
+                session.reasoning_effort = Some(resolved_effort);
+            }
+        }
 
         Ok(acp::SetSessionConfigOptionResponse::new(config_options))
     }
