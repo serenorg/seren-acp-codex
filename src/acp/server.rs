@@ -534,6 +534,29 @@ impl CodexAgent {
         None
     }
 
+    fn replay_chunk_meta(item: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        let mut meta = serde_json::Map::new();
+        meta.insert("replay".to_string(), serde_json::Value::Bool(true));
+
+        if let Some(message_id) = item.get("id").and_then(|v| v.as_str()) {
+            meta.insert(
+                "messageId".to_string(),
+                serde_json::Value::String(message_id.to_string()),
+            );
+        }
+
+        if let Some(timestamp) = item
+            .get("timestamp")
+            .or_else(|| item.get("createdAt"))
+            .or_else(|| item.get("created_at"))
+            .cloned()
+        {
+            meta.insert("timestamp".to_string(), timestamp);
+        }
+
+        meta
+    }
+
     async fn replay_thread_items(
         &self,
         session_id: &acp::SessionId,
@@ -560,6 +583,8 @@ impl CodexAgent {
             return Ok(());
         };
 
+        let replay_meta = Self::replay_chunk_meta(item);
+
         match item_type {
             "userMessage" => {
                 if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
@@ -568,11 +593,12 @@ impl CodexAgent {
                             let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
                             self.emit_session_update(
                                 session_id.clone(),
-                                acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
-                                    acp::ContentBlock::Text(acp::TextContent::new(
-                                        text.to_string(),
-                                    )),
-                                )),
+                                acp::SessionUpdate::UserMessageChunk(
+                                    acp::ContentChunk::new(acp::ContentBlock::Text(
+                                        acp::TextContent::new(text.to_string()),
+                                    ))
+                                    .meta(replay_meta.clone()),
+                                ),
                             )
                             .await?;
                         }
@@ -583,9 +609,12 @@ impl CodexAgent {
                 let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 self.emit_session_update(
                     session_id.clone(),
-                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                        acp::ContentBlock::Text(acp::TextContent::new(text.to_string())),
-                    )),
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                            text.to_string(),
+                        )))
+                        .meta(replay_meta.clone()),
+                    ),
                 )
                 .await?;
             }
@@ -603,9 +632,12 @@ impl CodexAgent {
                 if !text.is_empty() {
                     self.emit_session_update(
                         session_id.clone(),
-                        acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
-                            acp::ContentBlock::Text(acp::TextContent::new(text)),
-                        )),
+                        acp::SessionUpdate::AgentThoughtChunk(
+                            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                                text,
+                            )))
+                            .meta(replay_meta.clone()),
+                        ),
                     )
                     .await?;
                 }
