@@ -49,6 +49,20 @@ RUST_LOG=debug cargo run --release --bin seren-acp-codex
 | `ask` | Ask before running tools (default) |
 | `auto` | Auto-approve safe operations |
 
+## Sandbox configuration
+
+`seren-acp-codex` configures Codex sandbox mode from `SEREN_ACP_CODEX_SANDBOX`.
+
+- `workspace-write` (default)
+- `danger-full-access`
+- `read-only`
+
+Example:
+
+```bash
+SEREN_ACP_CODEX_SANDBOX=danger-full-access cargo run --release --bin seren-acp-codex
+```
+
 ## ACP support
 
 **Methods**

@@ -272,6 +272,26 @@ impl CodexAgent {
         }
     }
 
+    fn sandbox_mode_from_env() -> SandboxMode {
+        let Some(value) = std::env::var("SEREN_ACP_CODEX_SANDBOX").ok() else {
+            return SandboxMode::WorkspaceWrite;
+        };
+
+        let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "read-only" => SandboxMode::ReadOnly,
+            "workspace-write" => SandboxMode::WorkspaceWrite,
+            "danger-full-access" => SandboxMode::DangerFullAccess,
+            _ => {
+                log::warn!(
+                    "Invalid SEREN_ACP_CODEX_SANDBOX value '{}'; defaulting to 'workspace-write'",
+                    value
+                );
+                SandboxMode::WorkspaceWrite
+            }
+        }
+    }
+
     fn session_modes() -> acp::SessionModeState {
         let ask_mode =
             acp::SessionMode::new("ask", "Ask").description("Ask before running tools".to_string());
@@ -1475,12 +1495,14 @@ impl acp::Agent for CodexAgent {
         // Start a Codex thread
         let cwd = request.cwd.to_string_lossy().to_string();
         let default_approval_policy = Self::approval_policy_for_mode("ask");
+        let sandbox = Self::sandbox_mode_from_env();
+        log::info!("Using Codex sandbox mode: {:?}", sandbox);
         let thread_params = ThreadStartParams {
             cwd: Some(cwd.clone()),
             model: None,
             model_provider: None,
             approval_policy: Some(default_approval_policy),
-            sandbox: Some(SandboxMode::WorkspaceWrite),
+            sandbox: Some(sandbox),
             config: None,
             base_instructions: None,
             developer_instructions: None,
