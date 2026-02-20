@@ -72,7 +72,7 @@ SEREN_ACP_CODEX_SANDBOX=danger-full-access cargo run --release --bin seren-acp-c
 - `prompt`
 - `setSessionMode`
 - `cancel`
-- `loadSession` is not supported
+- `loadSession` (resumes an existing Codex thread by ID)
 
 **High-level event mapping**
 - ACP session = Codex thread
