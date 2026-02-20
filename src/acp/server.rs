@@ -2048,10 +2048,20 @@ impl acp::Agent for CodexAgent {
                                     .and_then(|e| e.get("additionalDetails"))
                                     .and_then(|v| v.as_str());
 
+                                // Cap additionalDetails so large shell output (e.g. pyenv
+                                // rehash errors, captured file contents) doesn't produce a
+                                // multi-KB error string. The full payload is still available
+                                // in the structured err.data below.
+                                const MAX_DETAILS_LEN: usize = 500;
                                 let mut full_message = message.to_string();
                                 if let Some(details) = additional_details {
                                     full_message.push_str("\n\n");
-                                    full_message.push_str(details);
+                                    if details.len() > MAX_DETAILS_LEN {
+                                        full_message.push_str(&details[..MAX_DETAILS_LEN]);
+                                        full_message.push_str("\u{2026} (truncated)");
+                                    } else {
+                                        full_message.push_str(details);
+                                    }
                                 }
 
                                 let mut err = acp::Error::new(
