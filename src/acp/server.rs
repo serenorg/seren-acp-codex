@@ -1593,6 +1593,7 @@ impl acp::Agent for CodexAgent {
             .thread_resume(crate::codex::ThreadResumeParams {
                 thread_id: thread_id.clone(),
                 cwd: Some(cwd.clone()),
+                sandbox: Some(Self::sandbox_mode_from_env()),
                 ..Default::default()
             })
             .await
