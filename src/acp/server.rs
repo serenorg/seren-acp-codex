@@ -73,6 +73,8 @@ struct SessionData {
     reasoning_effort: Option<String>,
     last_turn_diff: Option<String>,
     known_tool_calls: HashSet<String>,
+    /// Number of prompts sent in this session (used for compaction signaling)
+    prompt_count: u32,
 }
 
 /// Codex ACP Agent - bridges ACP protocol to Codex app-server
@@ -1564,6 +1566,7 @@ impl acp::Agent for CodexAgent {
                     reasoning_effort: resolved_reasoning_effort,
                     last_turn_diff: None,
                     known_tool_calls: HashSet::new(),
+                    prompt_count: 0,
                 },
             );
         }
@@ -1626,6 +1629,7 @@ impl acp::Agent for CodexAgent {
                     reasoning_effort: reasoning_effort.clone(),
                     last_turn_diff: None,
                     known_tool_calls: HashSet::new(),
+                    prompt_count: 0,
                 },
             );
         }
@@ -2086,20 +2090,31 @@ impl acp::Agent for CodexAgent {
             }
         }
 
-        // Clear active turn
-        {
+        // Clear active turn and increment prompt count
+        let prompt_count = {
             let mut sessions = self.sessions.write().await;
             let session_id_str: &str = &request.session_id.0;
             if let Some(session) = sessions.get_mut(session_id_str) {
                 session.current_turn_id = None;
+                session.prompt_count += 1;
+                session.prompt_count
+            } else {
+                0
             }
-        }
+        };
 
         if let Some(err) = turn_failure {
             return Err(err);
         }
 
-        Ok(acp::PromptResponse::new(stop_reason))
+        // Attach prompt count as _meta so frontend can track compaction needs
+        let mut response = acp::PromptResponse::new(stop_reason);
+        if prompt_count > 0 {
+            let mut meta = serde_json::Map::new();
+            meta.insert("numTurns".into(), serde_json::json!(prompt_count));
+            response = response.meta(meta);
+        }
+        Ok(response)
     }
 
     async fn cancel(&self, request: acp::CancelNotification) -> Result<(), acp::Error> {
