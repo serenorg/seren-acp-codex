@@ -45,7 +45,10 @@ impl CodexClient {
     pub async fn connect(_url: &str, mcp_servers: Option<Vec<McpServerConfig>>) -> Result<Self> {
         info!("Spawning Codex app-server process");
 
-        let mut cmd = Command::new("codex");
+        // Use CODEX_CLI_PATH if set (provided by seren-desktop), otherwise fall back to PATH.
+        let codex_bin = std::env::var("CODEX_CLI_PATH").unwrap_or_else(|_| "codex".to_string());
+        info!("Using codex binary: {}", codex_bin);
+        let mut cmd = Command::new(&codex_bin);
         cmd.arg("app-server");
 
         // Add MCP server configurations as -c arguments
