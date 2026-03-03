@@ -61,6 +61,16 @@ impl CodexClient {
             }
         }
 
+        // On Windows, isolate the child from the parent's console process group so that
+        // Ctrl+C signals sent to the Tauri window don't propagate and kill the sidecar
+        // (exit code 0xc000013a / STATUS_CONTROL_C_EXIT).
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
