@@ -2342,6 +2342,50 @@ impl acp::Agent for CodexAgent {
         Ok(acp::ListSessionsResponse::new(sessions).next_cursor(next_cursor))
     }
 
+    async fn fork_session(
+        &self,
+        request: acp::ForkSessionRequest,
+    ) -> Result<acp::ForkSessionResponse, acp::Error> {
+        let source_thread_id = request.session_id.0.as_ref().to_string();
+        log::info!("[ACP] Fork session request for thread {}", source_thread_id);
+
+        let mcp_servers = convert_acp_mcp_to_codex(&request.mcp_servers);
+        let codex = self.get_codex(mcp_servers).await?;
+        self.ensure_authenticated(&codex).await?;
+
+        let cwd = request.cwd.to_string_lossy().to_string();
+        let sandbox = Self::sandbox_mode_from_env();
+
+        let thread_start = codex
+            .thread_start_full(ThreadStartParams {
+                cwd: Some(cwd.clone()),
+                model: None,
+                model_provider: None,
+                approval_policy: Some(Self::approval_policy_for_mode("ask")),
+                sandbox: Some(sandbox),
+                config: None,
+                base_instructions: None,
+                developer_instructions: None,
+            })
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to start fork thread: {e}")))?;
+
+        let new_thread_id = thread_start
+            .get("thread")
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| acp::Error::new(-32603, "No thread.id in fork response"))?
+            .to_string();
+
+        log::info!(
+            "[ACP] Forked thread {} -> {}",
+            source_thread_id,
+            new_thread_id
+        );
+
+        Ok(acp::ForkSessionResponse::new(new_thread_id))
+    }
+
     async fn ext_method(&self, _request: acp::ExtRequest) -> Result<acp::ExtResponse, acp::Error> {
         Err(acp::Error::method_not_found())
     }
